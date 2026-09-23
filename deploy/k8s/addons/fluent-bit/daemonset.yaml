@@ -1,0 +1,79 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluent-bit
+  labels: { app.kubernetes.io/name: fluent-bit }
+spec:
+  selector:
+    matchLabels: { app.kubernetes.io/name: fluent-bit }
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate: { maxUnavailable: 1 }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: fluent-bit }
+    spec:
+      serviceAccountName: fluent-bit
+      automountServiceAccountToken: false
+      # Любые taint рабочих узлов (включая будущие) не должны оставить узел без сбора логов.
+      tolerations:
+        - operator: Exists
+      # Кроме группы loadgen: на её узле по замыслу ops.yml нет ничего, кроме k6, и логов maskarad
+      # там не бывает. Taint role=loadgen агент терпит, поэтому исключаем узел по метке.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - { key: role, operator: NotIn, values: [loadgen] }
+      securityContext:
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: fluent-bit
+          # Зеркало Docker Hub в Yandex Container Registry: образ amd64 байт-в-байт с fluent/fluent-bit:4.2.8
+          # (digest платформенного манифеста совпадает). Плавающие теги в зеркале отстают, поэтому digest.
+          image: cr.yandex/mirror/fluent/fluent-bit:4.2.8@sha256:9d34d17329df76479231b99e7952be9f8ca31cd18d0b4c278cd05bf51e89f169
+          command: [/fluent-bit/bin/fluent-bit]
+          args: [-c, /fluent-bit/etc/conf/fluent-bit.yaml]
+          env:
+            - name: NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+            - name: MONIUM_PROJECT
+              value: folder__${YC_FOLDER_ID}
+            - name: MONIUM_API_KEY
+              valueFrom: { secretKeyRef: { name: monium-api-key, key: api-key } }
+          ports: [{ containerPort: 2020, name: http }]
+          # Только «процесс жив»: /api/v1/health с health_check завязан на ошибки выхода, и при
+          # недоступном Monium kubelet перезапускал бы агент по кругу, а буфер и так на диске.
+          livenessProbe:
+            httpGet: { path: /, port: http }
+            periodSeconds: 30
+            timeoutSeconds: 5
+          # request 200m: при насыщении узла CPU делится по request, и с 50m агент отставал от ротации
+          # логов kubelet — в стресс-прогоне 2026-09-23 выше 5 тыс. запросов/с Monium недополучил ~15 % строк.
+          # Лимит 1 ядро вместо 300m — запас на пик ~1.8 тыс. строк/с на узел: сколько агент тратит на узле,
+          # не измерено (cAdvisor-скрейп namespace observability не берёт).
+          resources:
+            # ephemeral-storage — только собственный лог контейнера: буфер и позиции лежат на hostPath.
+            requests: { cpu: "200m", memory: "64Mi", ephemeral-storage: "64Mi" }
+            limits: { cpu: "1", memory: "256Mi", ephemeral-storage: "512Mi" }
+          # root нужен, чтобы читать логи подов (файлы root 0640) и писать буфер на hostPath;
+          # capabilities не нужны: владельцу root хватает прав на файлы.
+          securityContext:
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: config, mountPath: /fluent-bit/etc/conf, readOnly: true }
+            - { name: varlog, mountPath: /var/log, readOnly: true }
+            - { name: state, mountPath: /var/lib/fluent-bit }
+      volumes:
+        - name: config
+          configMap: { name: fluent-bit-config }
+        # /var/log/containers/*.log — симлинки в /var/log/pods, поэтому монтируется весь /var/log.
+        - name: varlog
+          hostPath: { path: /var/log }
+        # Позиции tail (sqlite) и чанки буфера переживают рестарт и обновление пода.
+        - name: state
+          hostPath: { path: /var/lib/fluent-bit, type: DirectoryOrCreate }

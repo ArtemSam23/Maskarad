@@ -1,0 +1,31 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus-agent
+  namespace: observability
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus-agent
+rules:
+  - apiGroups: [""]
+    resources: [pods, endpoints, services, nodes]
+    verbs: [get, list, watch]
+  # /metrics/cadvisor у kubelet: авторизация через SubjectAccessReview на nodes/metrics.
+  - apiGroups: [""]
+    resources: [nodes/metrics]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: prometheus-agent
+subjects:
+  - kind: ServiceAccount
+    name: prometheus-agent
+    namespace: observability

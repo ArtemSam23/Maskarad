@@ -1,0 +1,95 @@
+# Окружение production: https://maskarad.tech. Образ подставляет пайплайн (kustomize edit set image).
+# Размеры — по итогам нагрузочного прогона 2026-09-23 (узлы 2 vCPU / 4 ГБ, nodes_min = 4 в Terraform):
+# один под на узел с request 750m, HPA 4–8 по CPU 50 %, реплики жёстко разнесены по узлам.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: maskarad
+resources:
+  - namespace.yaml
+  - ../../base
+images:
+  - name: maskarad
+    newName: cr.yandex/REGISTRY_ID/maskarad
+    newTag: latest
+patches:
+  - target: { kind: Ingress, name: maskarad }
+    patch: |-
+      - op: replace
+        path: /spec/rules/0/host
+        value: maskarad.tech
+      - op: replace
+        path: /spec/tls/0/hosts/0
+        value: maskarad.tech
+  - target: { kind: HorizontalPodAutoscaler, name: maskarad }
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 4
+      - op: replace
+        path: /spec/maxReplicas
+        value: 8
+      - op: replace
+        path: /spec/metrics/0/resource/target/averageUtilization
+        value: 50
+      # Полчаса без уменьшения после пика: волны прогона идут с паузами, а каждый scale-in
+      # с последующим scale-out — это холодный под и просадка p99 на первых запросах.
+      - op: add
+        path: /spec/behavior
+        value:
+          scaleDown:
+            stabilizationWindowSeconds: 1800
+  - target: { kind: Deployment, name: maskarad }
+    patch: |-
+      # DoNotSchedule: при ScheduleAnyway обе реплики оказывались на одном узле и делили его 2 vCPU
+      # с ingress-nginx; теперь под ждёт узел, на котором ещё нет реплики.
+      - op: add
+        path: /spec/template/spec/topologySpreadConstraints
+        value:
+          - maxSkew: 1
+            topologyKey: kubernetes.io/hostname
+            whenUnsatisfiable: DoNotSchedule
+            labelSelector:
+              matchLabels: { app.kubernetes.io/name: maskarad }
+      # Жёстко «один под на узел». Spread с maxSkew 1 считает только узлы, готовые в момент планирования:
+      # 2026-09-23 выкатка началась при двух узлах, и два пода легли на первый готовый новый узел, пока
+      # второй ещё был с taint; DaemonSet-под ingress-nginx (request 300m) на том узле уже не поместился.
+      # С anti-affinity лишняя реплика ждёт свободный узел в Pending, а не уплотняет занятый.
+      - op: add
+        path: /spec/template/spec/affinity
+        value:
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              - topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels: { app.kubernetes.io/name: maskarad }
+      # 750m: HPA считает процент от request — реплика добавляется при ~375m реальной нагрузки на под,
+      # а планировщик резервирует поду большую часть узла. Память: L1-кэш соответствий
+      # (store.memory_capacity_bytes, по умолчанию 256 MiB) заполняется под нагрузкой; лимит 1.5 ГБ
+      # на узле с 4 ГБ оставляет место ingress-nginx и системным подам.
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests: { cpu: "750m", memory: "512Mi", ephemeral-storage: "64Mi" }
+          limits: { cpu: "2", memory: "1536Mi", ephemeral-storage: "1Gi" }
+      # 5 с между снятием пода с endpoints и SIGTERM: kube-proxy и ingress-nginx успевают убрать
+      # адрес из upstream, иначе часть запросов уходит в закрывающийся под. sleep action —
+      # GA в Kubernetes 1.32, узлы кластера на 1.35 (в образе distroless нет /bin/sleep для exec).
+      # Укладывается в terminationGracePeriodSeconds 20: 5 с + request_timeout_ms 8 с.
+      - op: add
+        path: /spec/template/spec/containers/0/lifecycle
+        value:
+          preStop:
+            sleep: { seconds: 5 }
+      # Один под на узел с request 750m: на 2 vCPU узле с ingress-nginx (300m) и системными подами
+      # второй под не помещается. Обновление по одному поду: старый снимается, новый встаёт на его узел.
+      # С nodes_max = 8 surge-под ({ maxUnavailable: 0, maxSurge: 1 } из base) мог бы вызвать
+      # добавление узла автоскейлером, но не возвращаем:
+      # - на пике HPA = 8 реплик = nodes_max, девятого узла под surge не будет — rollout висит
+      #   в Pending до scale-in (nodes_max = 9 — это ещё +32 ГиБ квоты дисков и +1 публичный адрес);
+      # - вне пика surge-под ждёт новый узел 2–5 минут, а узел после rollout ещё 10 минут простаивает
+      #   до scale-down; деплой начинает зависеть от квот и скорости облака, а не только от кластера.
+      # Цена: на время замены одного пода ёмкость ниже на реплику (25 % при 4, 12.5 % при 8).
+      # rollout status в .github/actions/deploy ждёт 480 с — до 8 последовательных замен по ~20–30 с.
+      - op: replace
+        path: /spec/strategy/rollingUpdate
+        value: { maxUnavailable: 1, maxSurge: 0 }

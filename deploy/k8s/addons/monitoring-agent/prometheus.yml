@@ -1,0 +1,117 @@
+# ${YC_PROMETHEUS_WORKSPACE_ID} подставляет workflow: envsubst '$YC_PROMETHEUS_WORKSPACE_ID' (со списком переменных,
+# иначе envsubst затрёт любой другой `$` в конфиге). В relabel-правилах поэтому нет ни `$1`, ни `${1}`.
+global:
+  # 30s: бесплатно 50 млн значений в месяц через Prometheus Remote Write, расчёт серий в README.md.
+  scrape_interval: 30s
+  external_labels:
+    cluster: maskarad
+scrape_configs:
+  - job_name: maskarad
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names: [maskarad]
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+        regex: maskarad
+        action: keep
+      - source_labels: [__meta_kubernetes_pod_container_port_name]
+        regex: http
+        action: keep
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: namespace
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: maskarad_.*
+        action: keep
+      # 60 серий на под ради p95 по стадиям; _sum/_count остаются — среднее по стадии показывает, где время.
+      - source_labels: [__name__]
+        regex: maskarad_stage_duration_seconds_bucket
+        action: drop
+  - job_name: ingress-nginx
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names: [ingress-nginx]
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_component]
+        regex: controller
+        action: keep
+      # У контроллера четыре порта; метрики только на 10254 (controller.metrics.enabled в чарте).
+      - source_labels: [__meta_kubernetes_pod_container_port_number]
+        regex: "10254"
+        action: keep
+      # Метку namespace не добавляем: в метриках nginx она уже есть и означает namespace бэкенда,
+      # target-метка с тем же именем переименовала бы её в exported_namespace.
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+    metric_relabel_configs:
+      # response_duration_seconds (время ответа upstream) не берём: дублирует
+      # maskarad_request_duration_seconds, а стоит столько же серий, сколько request_duration_seconds.
+      - source_labels: [__name__]
+        regex: nginx_ingress_controller_(requests|request_duration_seconds_(bucket|count|sum)|nginx_process_connections|nginx_process_connections_total)
+        action: keep
+  - job_name: cadvisor
+    # CPU и память подов и узлов для серверного отчёта нагрузочного прогона (scripts/loadtest_report.sh):
+    # node-exporter и kube-state-metrics в кластере больше нет, а cAdvisor kubelet отдаёт сам.
+    scheme: https
+    metrics_path: /metrics/cadvisor
+    bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+    tls_config:
+      # Сертификат kubelet самоподписанный, без SAN на адрес узла.
+      insecure_skip_verify: true
+    kubernetes_sd_configs:
+      - role: node
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_node_name]
+        target_label: node
+    metric_relabel_configs:
+      # Одним keep «или» не выразить, поэтому имя, namespace, container и id склеены в одну строку.
+      # Остаются: CPU и working set контейнеров maskarad и ingress-nginx (container="" — уровень пода
+      # и pause, не контейнер), корневой cgroup id="/" (CPU и память узла целиком) и число ядер узла.
+      - source_labels: [__name__, namespace, container, id]
+        regex: 'container_(cpu_usage_seconds_total|memory_working_set_bytes);(maskarad|ingress-nginx);[^;]+;.*|container_(cpu_usage_seconds_total|memory_working_set_bytes);;;/|machine_cpu_cores;;;'
+        action: keep
+      # Старые runtime помечают pause как container="POD" (на containerd 2.x это container="").
+      - source_labels: [container]
+        regex: POD
+        action: drop
+  # Доставка логов в Monium: 4xx и partialSuccess Fluent Bit не повторяет, строки теряются молча —
+  # счётчики выхода по узлам единственный сигнал об этом. 4 серии на узел.
+  - job_name: fluent-bit
+    metrics_path: /api/v2/metrics/prometheus
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names: [observability]
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+        regex: fluent-bit
+        action: keep
+      - source_labels: [__meta_kubernetes_pod_container_port_name]
+        regex: http
+        action: keep
+      - source_labels: [__meta_kubernetes_pod_node_name]
+        target_label: node
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: fluentbit_output_(proc_records|dropped_records|errors|retries_failed)_total
+        action: keep
+remote_write:
+  - url: https://monitoring.api.cloud.yandex.net/prometheus/workspaces/${YC_PROMETHEUS_WORKSPACE_ID}/api/v1/write
+    bearer_token_file: /etc/monitoring/api-key
+    queue_config:
+      max_samples_per_send: 2000
+      min_backoff: 100ms
+      max_backoff: 15s
+      # Квота записи воркспейса — 1000 запросов/с и 80 МБ/с; при 429 повторяем, а не теряем батч.
+      retry_on_http_429: true
+    metadata_config:
+      send: false
+    write_relabel_configs:
+      # Служебные серии скрейпа (4 на цель) metric_relabel_configs не трогает; up остаётся.
+      - source_labels: [__name__]
+        regex: scrape_(duration_seconds|samples_post_metric_relabeling|samples_scraped|series_added)
+        action: drop

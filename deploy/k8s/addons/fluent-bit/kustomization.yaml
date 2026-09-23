@@ -1,0 +1,13 @@
+# kubectl kustomize deploy/k8s/addons/fluent-bit | envsubst '$YC_FOLDER_ID' | kubectl apply -f -
+# Namespace observability создаёт monitoring-agent; Secret monium-api-key (ключ api-key) — infra.yml.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: observability
+resources:
+  - serviceaccount.yaml
+  - daemonset.yaml
+# Хеш-суффикс в имени ConfigMap: правка fluent-bit.yaml перекатывает DaemonSet сам,
+# hot reload Fluent Bit не нужен.
+configMapGenerator:
+  - name: fluent-bit-config
+    files: [fluent-bit.yaml]

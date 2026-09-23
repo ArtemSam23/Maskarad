@@ -1,0 +1,169 @@
+name: Deploy to Kubernetes
+description: Applies a kustomize overlay with the given image, waits for the rollout, rolls back on failure, runs the smoke test
+inputs:
+  overlay: { required: true }
+  namespace: { required: true }
+  image: { required: true }
+  tag: { required: true }
+  url: { required: true }
+  sa-key: { required: true }
+  cloud-id: { required: true }
+  folder-id: { required: true }
+  state-bucket: { required: true }
+  s3-access-key: { required: true }
+  s3-secret-key: { required: true }
+  store-key: { required: true }
+  masking-secret: { required: true }
+  admin-key: { required: true }
+  support-bot-key: { required: true }
+  analytics-key: { required: true }
+  llm-base-url: { required: false, default: "" }
+  llm-api-key: { required: false, default: "" }
+  demo-mode: { required: false, default: "false" }
+runs:
+  using: composite
+  steps:
+    - uses: ./.github/actions/yc
+      with:
+        sa-key: ${{ inputs.sa-key }}
+        cloud-id: ${{ inputs.cloud-id }}
+        folder-id: ${{ inputs.folder-id }}
+    - uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: "1.9.8"
+        terraform_wrapper: false
+    - uses: azure/setup-kubectl@v4
+    - uses: imranismail/setup-kustomize@v2
+    - name: Required secrets are present
+      shell: bash
+      env:
+        MASKARAD_STORE_KEY: ${{ inputs.store-key }}
+        MASKARAD_SECRET: ${{ inputs.masking-secret }}
+        MASKARAD_ADMIN_KEY: ${{ inputs.admin-key }}
+        SUPPORT_BOT_KEY: ${{ inputs.support-bot-key }}
+        ANALYTICS_KEY: ${{ inputs.analytics-key }}
+      run: |
+        missing=""
+        for name in MASKARAD_STORE_KEY MASKARAD_SECRET MASKARAD_ADMIN_KEY SUPPORT_BOT_KEY ANALYTICS_KEY; do
+          [ -n "${!name}" ] || missing="$missing $name"
+        done
+        if [ -n "$missing" ]; then
+          echo "::error::Missing GitHub secrets:$missing — add them in Settings → Secrets and variables → Actions (see infra/README.md)"
+          exit 1
+        fi
+    - name: Redis and cluster from Terraform state
+      shell: bash
+      env:
+        AWS_ACCESS_KEY_ID: ${{ inputs.s3-access-key }}
+        AWS_SECRET_ACCESS_KEY: ${{ inputs.s3-secret-key }}
+        TF_IN_AUTOMATION: "true"
+        TF_INPUT: "0"
+      run: |
+        set -euo pipefail
+        terraform -chdir=infra/terraform init -backend-config="bucket=${{ inputs.state-bucket }}" >/dev/null
+        redis_url="$(terraform -chdir=infra/terraform output -raw redis_url)"
+        echo "::add-mask::$redis_url"
+        echo "REDIS_URL=$redis_url" >> "$GITHUB_ENV"
+        echo "CLUSTER_NAME=$(terraform -chdir=infra/terraform output -raw cluster_name)" >> "$GITHUB_ENV"
+    - name: Kubeconfig
+      shell: bash
+      run: yc managed-kubernetes cluster get-credentials "$CLUSTER_NAME" --external --force
+    - name: Namespace and secrets
+      shell: bash
+      env:
+        NS: ${{ inputs.namespace }}
+        MASKARAD_STORE_KEY: ${{ inputs.store-key }}
+        MASKARAD_SECRET: ${{ inputs.masking-secret }}
+        MASKARAD_ADMIN_KEY: ${{ inputs.admin-key }}
+        SUPPORT_BOT_KEY: ${{ inputs.support-bot-key }}
+        ANALYTICS_KEY: ${{ inputs.analytics-key }}
+        LLM_BASE_URL: ${{ inputs.llm-base-url }}
+        LLM_API_KEY: ${{ inputs.llm-api-key }}
+        MASKARAD_DEMO_MODE: ${{ inputs.demo-mode }}
+      run: |
+        set -euo pipefail
+        kubectl get namespace "$NS" >/dev/null 2>&1 || kubectl create namespace "$NS"
+        kubectl -n "$NS" create secret generic maskarad-secrets \
+          --from-literal=REDIS_URL="$REDIS_URL" \
+          --from-literal=MASKARAD_STORE_KEY="$MASKARAD_STORE_KEY" \
+          --from-literal=MASKARAD_SECRET="$MASKARAD_SECRET" \
+          --from-literal=MASKARAD_ADMIN_KEY="$MASKARAD_ADMIN_KEY" \
+          --from-literal=SUPPORT_BOT_KEY="$SUPPORT_BOT_KEY" \
+          --from-literal=ANALYTICS_KEY="$ANALYTICS_KEY" \
+          --from-literal=LLM_BASE_URL="$LLM_BASE_URL" \
+          --from-literal=LLM_API_KEY="$LLM_API_KEY" \
+          --from-literal=MASKARAD_DEMO_MODE="$MASKARAD_DEMO_MODE" \
+          --dry-run=client -o yaml | kubectl apply -f -
+    - name: Apply manifests
+      shell: bash
+      env:
+        NS: ${{ inputs.namespace }}
+      run: |
+        set -euo pipefail
+        cd "deploy/k8s/overlays/${{ inputs.overlay }}"
+        kustomize edit set image "maskarad=${{ inputs.image }}:${{ inputs.tag }}"
+        kustomize build . | kubectl apply -f -
+        # production обновляется по одному поду (maxUnavailable 1, maxSurge 0): до 8 последовательных
+        # замен по ~20–30 с (preStop 5 с, pull, readiness) — 240 с при 8 репликах впритык.
+        if ! kubectl -n "$NS" rollout status deployment/maskarad --timeout=480s; then
+          echo "::error::rollout failed, rolling back"
+          kubectl -n "$NS" describe deployment/maskarad | tail -30
+          kubectl -n "$NS" logs deployment/maskarad --tail=50 || true
+          kubectl -n "$NS" rollout undo deployment/maskarad
+          kubectl -n "$NS" rollout status deployment/maskarad --timeout=480s || true
+          exit 1
+        fi
+    - name: Retry TLS issuance after a failed ACME order
+      shell: bash
+      env:
+        NS: ${{ inputs.namespace }}
+      # Первый заказ Let's Encrypt мог провалиться, пока балансировщик не отвечал; cert-manager
+      # повторяет попытку с большой задержкой. Пересоздание Certificate запускает выпуск заново.
+      run: |
+        set -euo pipefail
+        ready=$(kubectl -n "$NS" get certificate maskarad-tls -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "")
+        if [ "$ready" != "True" ]; then
+          invalid=$(kubectl -n "$NS" get order -o jsonpath='{range .items[?(@.status.state=="invalid")]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
+          if [ -n "$invalid" ]; then
+            echo "certificate $NS/maskarad-tls not ready and an ACME order is invalid: recreating the certificate"
+            kubectl -n "$NS" delete certificate maskarad-tls --ignore-not-found
+          fi
+        fi
+    - name: External reachability (advisory)
+      shell: bash
+      # Путь из раннеров GitHub до балансировщика нестабилен; проверка ниже выполняется внутри кластера.
+      run: |
+        ok=0
+        for i in 1 2 3; do
+          if curl -sk -m 10 -o /dev/null -w "attempt $i: http=%{http_code} connect=%{time_connect}s\n" "${{ inputs.url }}/healthz"; then ok=1; else echo "attempt $i: no answer"; fi
+        done
+        [ "$ok" = 1 ] || echo "::warning::${{ inputs.url }} did not answer from the GitHub runner; the smoke test runs inside the cluster"
+    - name: Wait for the TLS certificate
+      id: tls
+      shell: bash
+      env:
+        NS: ${{ inputs.namespace }}
+      run: |
+        for i in $(seq 1 36); do
+          ready=$(kubectl -n "$NS" get certificate maskarad-tls -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "")
+          if [ "$ready" = "True" ]; then echo "certificate is ready"; echo "insecure=" >> "$GITHUB_OUTPUT"; exit 0; fi
+          sleep 5
+        done
+        echo "::warning::TLS certificate for ${{ inputs.url }} is not issued yet; smoke test runs without certificate validation"
+        echo "insecure=--insecure" >> "$GITHUB_OUTPUT"
+    - name: Smoke test inside the cluster
+      shell: bash
+      env:
+        NS: ${{ inputs.namespace }}
+        IMAGE: ${{ inputs.image }}:${{ inputs.tag }}
+        URL: ${{ inputs.url }}
+        INSECURE: ${{ steps.tls.outputs.insecure }}
+      run: |
+        set -euo pipefail
+        # shellcheck disable=SC2086
+        scripts/k8s_job.sh "$NS" smoke "$IMAGE" 300 smoke "$URL" $INSECURE
+        {
+          echo "## ${{ inputs.overlay }}: ${{ inputs.image }}:${{ inputs.tag }}"
+          echo "- URL: ${{ inputs.url }}"
+          echo '- Smoke (внутри кластера): OK'
+        } >> "$GITHUB_STEP_SUMMARY"

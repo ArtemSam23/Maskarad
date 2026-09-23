@@ -1,0 +1,159 @@
+# Доставка: после зелёного CI на main собирается образ, production выкатывается по одобрению
+# в environment (deploy action: rollout, откат при провале rollout, smoke внутри кластера), затем
+# контрольный нагрузочный прогон на production. Провал прогона job роняет, но выкат не откатывает:
+# он уже прошёл smoke, команда отката печатается в лог.
+name: cd
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Коммит или ветка для сборки
+        default: main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cd
+  cancel-in-progress: false
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "0"
+  TF_DIR: infra/terraform
+  AWS_ACCESS_KEY_ID: ${{ secrets.YC_S3_ACCESS_KEY }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.YC_S3_SECRET_KEY }}
+  STATE_BUCKET: maskarad-tfstate-${{ vars.YC_FOLDER_ID || 'b1gg8haq1qnfi8a272of' }}
+  SOURCE_REF: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.ref }}
+
+jobs:
+  build:
+    name: build and push image
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_REF }}
+      - uses: ./.github/actions/yc
+        with:
+          sa-key: ${{ secrets.YC_SA_KEY_JSON }}
+          cloud-id: ${{ vars.YC_CLOUD_ID || 'b1gt5hdhuc4hovu7kij9' }}
+          folder-id: ${{ vars.YC_FOLDER_ID || 'b1gg8haq1qnfi8a272of' }}
+      - name: Image name (waits up to 25 minutes for the registry created by the infra workflow)
+        id: meta
+        shell: bash
+        run: |
+          registry_id=""
+          for i in $(seq 1 50); do
+            registry_id="$(yc container registry get --name maskarad --format json 2>/dev/null | jq -r '.id // empty' || true)"
+            [ -n "$registry_id" ] && break
+            echo "registry not found yet, waiting ($i/50)"; sleep 30
+          done
+          if [ -z "$registry_id" ]; then
+            echo "::error::Container registry 'maskarad' does not exist — run the infra workflow first"; exit 1
+          fi
+          tag="sha-$(git rev-parse --short=12 HEAD)"
+          echo "image=cr.yandex/$registry_id/maskarad" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: Registry login
+        run: yc container registry configure-docker
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.image }}:main
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+  production:
+    name: deploy production
+    needs: [build]
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://maskarad.tech
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_REF }}
+      - uses: ./.github/actions/deploy
+        with:
+          overlay: production
+          namespace: maskarad
+          image: ${{ needs.build.outputs.image }}
+          tag: ${{ needs.build.outputs.tag }}
+          url: https://maskarad.tech
+          sa-key: ${{ secrets.YC_SA_KEY_JSON }}
+          cloud-id: ${{ vars.YC_CLOUD_ID || 'b1gt5hdhuc4hovu7kij9' }}
+          folder-id: ${{ vars.YC_FOLDER_ID || 'b1gg8haq1qnfi8a272of' }}
+          state-bucket: ${{ env.STATE_BUCKET }}
+          s3-access-key: ${{ secrets.YC_S3_ACCESS_KEY }}
+          s3-secret-key: ${{ secrets.YC_S3_SECRET_KEY }}
+          store-key: ${{ secrets.MASKARAD_STORE_KEY }}
+          masking-secret: ${{ secrets.MASKARAD_SECRET }}
+          admin-key: ${{ secrets.MASKARAD_ADMIN_KEY }}
+          support-bot-key: ${{ secrets.SUPPORT_BOT_KEY }}
+          analytics-key: ${{ secrets.ANALYTICS_KEY }}
+          llm-base-url: ${{ secrets.LLM_BASE_URL }}
+          llm-api-key: ${{ secrets.LLM_API_KEY }}
+          demo-mode: "true"
+
+  verify:
+    name: post-deploy check on production
+    needs: [build, production]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_REF }}
+      - uses: ./.github/actions/yc
+        with:
+          sa-key: ${{ secrets.YC_SA_KEY_JSON }}
+          cloud-id: ${{ vars.YC_CLOUD_ID || 'b1gt5hdhuc4hovu7kij9' }}
+          folder-id: ${{ vars.YC_FOLDER_ID || 'b1gg8haq1qnfi8a272of' }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+          terraform_wrapper: false
+      - uses: azure/setup-kubectl@v4
+      - name: Kubeconfig
+        run: |
+          terraform -chdir=$TF_DIR init -backend-config="bucket=$STATE_BUCKET" >/dev/null
+          yc managed-kubernetes cluster get-credentials "$(terraform -chdir=$TF_DIR output -raw cluster_name)" --external --force
+      - name: Bench inside the cluster (checker protocol, 100 pairs/s for 30 s)
+        shell: bash
+        # Генератор запускается как Job рядом с сервисом и ходит через публичный адрес балансировщика.
+        # Откат при провале не автоматический: выкат уже прошёл smoke в deploy action, а провал
+        # здесь может быть и не в новой версии (балансировщик, Redis), решает человек.
+        run: |
+          set -uo pipefail
+          insecure=""
+          ready=$(kubectl -n maskarad get certificate maskarad-tls -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "")
+          [ "$ready" = "True" ] || insecure="--insecure"
+          job_rc=0
+          # shellcheck disable=SC2086
+          scripts/k8s_job.sh maskarad bench "${{ needs.build.outputs.image }}:${{ needs.build.outputs.tag }}" 300 \
+            bench --url https://maskarad.tech --rps 100 --duration 30 --generate 60 $insecure | tee bench.txt || job_rc=$?
+          { echo '## Нагрузочный прогон production (Job внутри кластера через публичный адрес балансировщика)'; cat bench.txt; } >> "$GITHUB_STEP_SUMMARY"
+          fail=""
+          [ "$job_rc" -eq 0 ] || { echo "::error::bench job failed (exit $job_rc)"; fail=1; }
+          grep -q '^| Пар отправлено' bench.txt || { echo '::error::bench produced no report'; fail=1; }
+          if grep -qE '^\| (Маскирование|Демаскирование) 200 / ошибок \| [0-9]+ / [1-9]' bench.txt; then echo '::error::bench: request errors'; fail=1; fi
+          if grep -qE '^\| Демаскирование ≠ оригинал \| [1-9]' bench.txt; then echo '::error::bench: demask mismatches'; fail=1; fi
+          if [ -n "$fail" ]; then
+            echo "::error::production check failed after the rollout of ${{ needs.build.outputs.tag }}; roll back by hand: kubectl -n maskarad rollout undo deployment/maskarad"
+            exit 1
+          fi

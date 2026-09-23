@@ -1,0 +1,250 @@
+# Fluent Bit 4.2 (YAML-формат): логи подов maskarad и ingress-nginx → Monium по OTLP/HTTP.
+# Переменные окружения задаёт DaemonSet: MONIUM_API_KEY (Secret monium-api-key), MONIUM_PROJECT,
+# NODE_NAME (downward API, spec.nodeName).
+#
+# Атрибуты ресурса (service.name, cluster, host) в 4.2 ставит только content_modifier с
+# context: otel_resource_attributes, и значение у него статическое, из записи его не взять.
+# Поэтому по входу tail на сервис: путь файла фиксирует namespace и контейнер, service.name —
+# константа входа. Все filter-плагины стоят в processors входа ДО opentelemetry_envelope:
+# обычный filter (секция filters) выкидывает group-маркеры, и атрибуты ресурса до выхода не доезжают.
+service:
+  flush: 1
+  log_level: info
+  http_server: on
+  http_listen: 0.0.0.0
+  http_port: 2020
+  # Потолок паузы между повторами чанка (по умолчанию 2000 с): после простоя Monium очередь
+  # уезжает за минуту, а не за полчаса.
+  scheduler.base: 5
+  scheduler.cap: 60
+  # Чанки на hostPath: при недоступном Monium буфер растёт на диске узла, а не в памяти;
+  # переживает рестарт пода (storage_backlog дочитывает остаток).
+  storage.path: /var/lib/fluent-bit/storage
+  storage.sync: normal
+  storage.checksum: off
+  # Битый чанк (узел упал посреди записи) удаляется, а не висит в очереди.
+  storage.delete_irrecoverable_chunks: on
+  # Сколько чанков (до ~2 МБ каждый) держать в памяти на все входы с filesystem-буфером.
+  storage.max_chunks_up: 32
+  storage.backlog.mem_limit: 16M
+  storage.metrics: on
+
+pipeline:
+  inputs:
+    - name: tail
+      alias: maskarad
+      tag: kube.*
+      # <pod>_<namespace>_<container>-<container id>.log: только контейнер maskarad в namespace maskarad.
+      path: /var/log/containers/*_maskarad_maskarad-*.log
+      multiline.parser: cri
+      db: /var/lib/fluent-bit/tail-maskarad.db
+      db.locking: true
+      # Файл без позиции в db читается с начала: иначе строки пода, стартовавшего на узле раньше
+      # агента, и строки за время переезда теряются. Позиции в db на hostPath, повторного чтения
+      # после рестарта агента нет.
+      read_from_head: true
+      # Файлы старше суток — остатки мёртвых контейнеров (например, после остановки кластера):
+      # Monium отбрасывает записи старше 24 ч, читать их незачем.
+      ignore_older: 24h
+      refresh_interval: 5
+      rotate_wait: 10
+      skip_long_lines: on
+      buffer_max_size: 1M
+      storage.type: filesystem
+      processors:
+        logs:
+          # use_tag_for_meta: pod/namespace/container из имени файла, без запросов к API и без RBAC.
+          - name: kubernetes
+            kube_tag_prefix: kube.var.log.containers.
+            use_tag_for_meta: on
+            merge_log: on
+            keep_log: off
+          - name: nest
+            operation: lift
+            nested_under: kubernetes
+            add_prefix: k8s_
+          - name: modify
+            rename:
+              - k8s_pod_name k8s.pod.name
+              - k8s_container_name k8s.container.name
+              # Monium: атрибут с префиксом labels. — метка (индекс, быстрый фильтр), остальное — meta.
+              # route/direction/system — конечные множества значений, по ним фильтруют.
+              - route labels.route
+              - direction labels.direction
+              - system labels.system
+              # request_id — «известный» атрибут: без префикса Monium делает его меткой, а метка с
+              # уникальным значением на каждый запрос раздувает индекс (converting-data, attributes-guide).
+              # Поэтому явно в meta. Прочие поля без префикса и так уходят в meta.
+              - request_id meta.request_id
+            # time и _p — служебные поля парсера cri, timestamp приложения дублирует время записи,
+            # namespace уходит в атрибуты ресурса. Monium тарифицирует объём записи.
+            remove:
+              - time
+              - _p
+              - timestamp
+              - k8s_namespace_name
+              - k8s_docker_id
+          # stderr сервиса — паника или сообщение рантайма: без уровня Monium посчитал бы их INFO.
+          # insert не трогает level, уже пришедший из JSON-строки.
+          - name: content_modifier
+            action: insert
+            key: level
+            value: ERROR
+            condition:
+              op: and
+              rules:
+                - field: "$stream"
+                  op: eq
+                  value: 'stderr'
+          - name: opentelemetry_envelope
+          - name: content_modifier
+            context: otel_resource_attributes
+            action: upsert
+            key: service.name
+            value: maskarad
+          - name: content_modifier
+            context: otel_resource_attributes
+            action: upsert
+            key: cluster
+            value: maskarad
+          - name: content_modifier
+            context: otel_resource_attributes
+            action: upsert
+            key: host
+            value: ${NODE_NAME}
+          - name: content_modifier
+            context: otel_resource_attributes
+            action: upsert
+            key: k8s.namespace.name
+            value: maskarad
+
+    - name: tail
+      alias: ingress-nginx
+      tag: kube.*
+      # access-лог контроллера выключен (disable-access-log в ingress-nginx.values.yaml),
+      # здесь только stderr nginx и контроллера.
+      path: /var/log/containers/*_ingress-nginx_controller-*.log
+      multiline.parser: cri
+      db: /var/lib/fluent-bit/tail-ingress-nginx.db
+      db.locking: true
+      read_from_head: true
+      # Файлы старше суток — остатки мёртвых контейнеров (например, после остановки кластера):
+      # Monium отбрасывает записи старше 24 ч, читать их незачем.
+      ignore_older: 24h
+      refresh_interval: 5
+      rotate_wait: 10
+      skip_long_lines: on
+      buffer_max_size: 1M
+      storage.type: filesystem
+      processors:
+        logs:
+          - name: kubernetes
+            kube_tag_prefix: kube.var.log.containers.
+            use_tag_for_meta: on
+            merge_log: on
+            keep_log: off
+          - name: nest
+            operation: lift
+            nested_under: kubernetes
+            add_prefix: k8s_
+          - name: modify
+            rename:
+              - k8s_pod_name k8s.pod.name
+              - k8s_container_name k8s.container.name
+            remove:
+              - time
+              - _p
+              - k8s_namespace_name
+              - k8s_docker_id
+          # Уровень текстовых строк ingress-nginx: klog контроллера (E/F/W + MMDD) и error.log nginx.
+          # content_modifier, а не modify: у modify в processors 4.2.8 condition молча игнорируется.
+          - name: content_modifier
+            action: insert
+            key: level
+            value: ERROR
+            condition:
+              op: and
+              rules:
+                - field: "$log"
+                  op: regex
+                  value: '^[EF]\d{4} '
+          - name: content_modifier
+            action: insert
+            key: level
+            value: WARN
+            condition:
+              op: and
+              rules:
+                - field: "$log"
+                  op: regex
+                  value: '^W\d{4} '
+          - name: content_modifier
+            action: insert
+            key: level
+            value: ERROR
+            condition:
+              op: and
+              rules:
+                - field: "$log"
+                  op: regex
+                  value: '\[(error|crit|alert|emerg)\]'
+          - name: content_modifier
+            action: insert
+            key: level
+            value: WARN
+            condition:
+              op: and
+              rules:
+                - field: "$log"
+                  op: regex
+                  value: '\[warn\]'
+          - name: opentelemetry_envelope
+          - name: content_modifier
+            context: otel_resource_attributes
+            action: upsert
+            key: service.name
+            value: ingress-nginx
+          - name: content_modifier
+            context: otel_resource_attributes
+            action: upsert
+            key: cluster
+            value: maskarad
+          - name: content_modifier
+            context: otel_resource_attributes
+            action: upsert
+            key: host
+            value: ${NODE_NAME}
+          - name: content_modifier
+            context: otel_resource_attributes
+            action: upsert
+            key: k8s.namespace.name
+            value: ingress-nginx
+
+  outputs:
+    - name: opentelemetry
+      match: kube.*
+      host: ingest.monium.yandex.cloud
+      port: 443
+      tls: on
+      tls.verify: on
+      # OTLP/HTTP, не grpc: on — в 4.2.8 и 5.1.2 compress при gRPC молча не применяется.
+      logs_uri: /otlp/v1/logs
+      compress: zstd
+      header:
+        # Схема Api-Key через дефис; «ApiKey» из текста документации Monium даёт 401.
+        - Authorization Api-Key ${MONIUM_API_KEY}
+        - x-monium-project ${MONIUM_PROJECT}
+      # JSON-строка сервиса: тело — message; текстовая строка (nginx, паника): тело — log.
+      # Остальные поля записи уходят в атрибуты. Тело-словарь Monium отбрасывает целиком
+      # (partialSuccess «log body is not a string»), поэтому ключ тела обязателен.
+      logs_body_key:
+        - $message
+        - $log
+      logs_body_key_attributes: true
+      # Уровень Monium берёт из severity_text (INFO/WARN/ERROR), severity_number может быть 0.
+      logs_severity_text_message_key: $level
+      log_response_payload: false
+      # Очередь выхода на диске. При переполнении выкидываются самые старые чанки: лучше потерять
+      # старые логи, чем забить диск узла, где живёт сервис.
+      storage.total_limit_size: 1G
+      retry_limit: no_limits

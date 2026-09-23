@@ -1,0 +1,377 @@
+{
+ "title": "Maskarad — latency / RPS / TPS / ПДн",
+ "uid": "maskarad",
+ "timezone": "browser",
+ "refresh": "5s",
+ "schemaVersion": 39,
+ "version": 1,
+ "time": {
+  "from": "now-15m",
+  "to": "now"
+ },
+ "templating": {
+  "list": [
+   {
+    "name": "DS",
+    "type": "datasource",
+    "query": "prometheus",
+    "current": {
+     "text": "Prometheus",
+     "value": "Prometheus"
+    }
+   }
+  ]
+ },
+ "panels": [
+  {
+   "id": 1,
+   "type": "timeseries",
+   "title": "RPS (запросов в секунду)",
+   "gridPos": {
+    "x": 0,
+    "y": 0,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS}"
+   },
+   "targets": [
+    {
+     "expr": "sum(rate(maskarad_requests_total[2m]))",
+     "legendFormat": "всего",
+     "refId": "A"
+    },
+    {
+     "expr": "sum by (route) (rate(maskarad_requests_total[2m]))",
+     "legendFormat": "{{route}}",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "reqps"
+    },
+    "overrides": []
+   },
+   "options": {}
+  },
+  {
+   "id": 2,
+   "type": "timeseries",
+   "title": "Latency p50 / p95 / p99",
+   "gridPos": {
+    "x": 12,
+    "y": 0,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS}"
+   },
+   "targets": [
+    {
+     "expr": "histogram_quantile(0.50, sum by (le) (rate(maskarad_request_duration_seconds_bucket[2m])))",
+     "legendFormat": "p50",
+     "refId": "A"
+    },
+    {
+     "expr": "histogram_quantile(0.95, sum by (le) (rate(maskarad_request_duration_seconds_bucket[2m])))",
+     "legendFormat": "p95",
+     "refId": "B"
+    },
+    {
+     "expr": "histogram_quantile(0.99, sum by (le) (rate(maskarad_request_duration_seconds_bucket[2m])))",
+     "legendFormat": "p99",
+     "refId": "C"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s"
+    },
+    "overrides": []
+   },
+   "options": {}
+  },
+  {
+   "id": 3,
+   "type": "timeseries",
+   "title": "TPS (токенов в секунду)",
+   "gridPos": {
+    "x": 0,
+    "y": 8,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS}"
+   },
+   "targets": [
+    {
+     "expr": "sum by (direction) (rate(maskarad_tokens_total[2m]))",
+     "legendFormat": "{{direction}}",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {}
+  },
+  {
+   "id": 4,
+   "type": "timeseries",
+   "title": "Ошибки и 429",
+   "gridPos": {
+    "x": 12,
+    "y": 8,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS}"
+   },
+   "targets": [
+    {
+     "expr": "sum by (status) (rate(maskarad_requests_total{status!=\"200\"}[2m]))",
+     "legendFormat": "HTTP {{status}}",
+     "refId": "A"
+    },
+    {
+     "expr": "sum by (reason) (rate(maskarad_rejected_total[2m]))",
+     "legendFormat": "rejected: {{reason}}",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {}
+  },
+  {
+   "id": 5,
+   "type": "timeseries",
+   "title": "Найденные типы ПДн (за 5 минут)",
+   "gridPos": {
+    "x": 0,
+    "y": 16,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS}"
+   },
+   "targets": [
+    {
+     "expr": "sum by (type) (increase(maskarad_pii_detected_total[5m]))",
+     "legendFormat": "{{type}}",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "stacking": {
+       "mode": "normal",
+       "group": "A"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {}
+  },
+  {
+   "id": 6,
+   "type": "timeseries",
+   "title": "Стадии обработки, среднее",
+   "gridPos": {
+    "x": 12,
+    "y": 16,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS}"
+   },
+   "targets": [
+    {
+     "expr": "sum by (stage) (rate(maskarad_stage_duration_seconds_sum[2m])) / sum by (stage) (rate(maskarad_stage_duration_seconds_count[2m]))",
+     "legendFormat": "{{stage}}",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s"
+    },
+    "overrides": []
+   },
+   "options": {}
+  },
+  {
+   "id": 7,
+   "type": "stat",
+   "title": "В обработке (inflight)",
+   "gridPos": {
+    "x": 0,
+    "y": 24,
+    "w": 6,
+    "h": 6
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS}"
+   },
+   "targets": [
+    {
+     "expr": "maskarad_inflight",
+     "legendFormat": "inflight",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {}
+  },
+  {
+   "id": 8,
+   "type": "stat",
+   "title": "Хранилище деградировано",
+   "gridPos": {
+    "x": 6,
+    "y": 24,
+    "w": 6,
+    "h": 6
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS}"
+   },
+   "targets": [
+    {
+     "expr": "maskarad_store_degraded",
+     "legendFormat": "degraded",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {}
+  },
+  {
+   "id": 9,
+   "type": "timeseries",
+   "title": "Операции хранилища",
+   "gridPos": {
+    "x": 12,
+    "y": 24,
+    "w": 12,
+    "h": 6
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS}"
+   },
+   "targets": [
+    {
+     "expr": "sum by (op, result) (rate(maskarad_store_ops_total[2m]))",
+     "legendFormat": "{{op}}/{{result}}",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {}
+  },
+  {
+   "id": 10,
+   "type": "timeseries",
+   "title": "LLM upstream",
+   "gridPos": {
+    "x": 0,
+    "y": 30,
+    "w": 12,
+    "h": 6
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS}"
+   },
+   "targets": [
+    {
+     "expr": "sum by (result) (rate(maskarad_llm_requests_total[2m]))",
+     "legendFormat": "{{result}}",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {}
+  },
+  {
+   "id": 11,
+   "type": "timeseries",
+   "title": "Лимит допуска",
+   "gridPos": {
+    "x": 12,
+    "y": 30,
+    "w": 12,
+    "h": 6
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS}"
+   },
+   "targets": [
+    {
+     "expr": "max by (pod) (maskarad_admission_limit)",
+     "legendFormat": "лимит {{pod}}",
+     "refId": "A"
+    },
+    {
+     "expr": "max by (pod) (max_over_time(maskarad_inflight[2m]))",
+     "legendFormat": "в обработке, макс. {{pod}}",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "options": {}
+  }
+ ]
+}

@@ -1,0 +1,66 @@
+# Конфигурация монтируется файлом. Секции systems, pii_types, allowlists, masking, detection, llm
+# и admin сервис перечитывает на лету (crates/maskarad/src/reload.rs). Секции server, store и logging
+# читаются один раз при старте (crates/maskarad/src/main.rs, serve/build_store/logging::init):
+# после их изменения нужен `kubectl -n <ns> rollout restart deployment/maskarad`.
+# Секреты (${…}) приходят из Secret maskarad-secrets через окружение.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: maskarad-config
+data:
+  maskarad.yaml: |
+    server:
+      listen: "0.0.0.0:8080"
+      # Потолок одновременных запросов на под (все полосы допуска вместе), защита по памяти. Задержку
+      # при нехватке CPU держит адаптивный лимит (docs/design.md, §12.1): на прогоне 2026-09-23 выше
+      # ~5000 запросов/с узлы упёрлись в CPU, а один статический лимит пускал всё — очередь в поде до
+      # ~1100, store_get 460 мс при ответе Valkey за 5–21 мкс, ingress p99 2.5 с. Пока CPU хватает,
+      # короткие запросы ограничены только потолком: пауза Valkey в пару секунд не превращается в 429.
+      max_inflight: 2048
+      request_timeout_ms: 8000
+      # enabled: false — один статический лимит max_inflight. large_limit по умолчанию — число CPU пода.
+      admission: { enabled: true, min_limit: 8, target_ms: 5 }
+    store:
+      backend: redis
+      redis_url: "${REDIS_URL}"
+      ttl_seconds: 3600
+      encryption_key: "${MASKARAD_STORE_KEY}"
+      memory_fallback: true
+      # Таймаут одной команды Valkey; после таймаута команда повторяется один раз, так что операция
+      # хранилища занимает не больше 2 с — заведомо меньше request_timeout_ms. Если и повтор не
+      # успел, /process отвечает 429 STORE_BUSY, и проверяющая система повторяет запрос.
+      timeout_ms: 1000
+    llm:
+      base_url: "${LLM_BASE_URL:-}"
+      api_key: "${LLM_API_KEY:-}"
+    admin:
+      api_key: "${MASKARAD_ADMIN_KEY:-}"
+    # info обязателен: строка на каждый запрос — требование ТЗ, при warn строки запросов не пишутся.
+    # Переменная MASKARAD_LOG_LEVEL нужна для локальной отладки (debug), не для прода.
+    logging: { format: json, level: ${MASKARAD_LOG_LEVEL:-info} }
+    ui: { enabled: true, allow_system_override: ${MASKARAD_DEMO_MODE:-false} }
+    masking:
+      secret: "${MASKARAD_SECRET}"
+    allowlists:
+      public_addresses: ["г. Москва, ул. Каланчёвская, д. 27"]
+      public_phones: ["8 800 200-00-00"]
+      corporate_email_domains: ["alfabank.ru"]
+    systems:
+      - id: alfasonar
+        description: "Проверяющая система (контракт /process, без ключа)"
+        auth: { anonymous: true }
+        demask: true
+        profile: reference
+      - id: support-chatbot
+        description: "Чат-бот поддержки, ходит в LLM через прокси"
+        auth: { api_keys: ["${SUPPORT_BOT_KEY}"] }
+        demask: true
+        profile: placeholder
+        combination_rules:
+          - { mask: PIN, only_if_present: [CARD_NUMBER] }
+      - id: analytics
+        description: "Аналитика: синтетика вместо ПДн, демаскирование запрещено"
+        auth: { api_keys: ["${ANALYTICS_KEY}"] }
+        pii_types: [FIO, PHONE, EMAIL, CARD_NUMBER, PASSPORT, ADDRESS, BIRTH_DATE, INN, SNILS]
+        demask: false
+        profile: synthetic

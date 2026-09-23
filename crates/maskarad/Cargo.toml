@@ -1,0 +1,46 @@
+[package]
+name = "maskarad"
+description = "PII masking proxy for LLM traffic: HTTP service, CLI and evaluation tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "maskarad"
+path = "src/main.rs"
+
+[dependencies]
+maskarad-core.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+tracing.workspace = true
+regex.workspace = true
+sha2.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+axum = { version = "0.8", features = ["http1", "json", "tokio", "macros"] }
+tokio = { version = "1", features = ["full"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["timeout", "cors", "set-header"] }
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+moka = { version = "0.12", features = ["future"] }
+aes-gcm = "0.10"
+base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+clap = { version = "4", features = ["derive"] }
+arc-swap = "1"
+notify = "8"
+async-trait = "0.1"
+http = "1"
+bytes = "1"
+# Спека OpenAPI генерируется из кода (derive ToSchema/OpenApi), а не пишется руками.
+utoipa = { version = "6", features = ["axum_extras"] }
+utoipa-redoc = { version = "7", features = ["axum"] }

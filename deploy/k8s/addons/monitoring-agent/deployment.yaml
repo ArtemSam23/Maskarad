@@ -1,0 +1,69 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus-agent
+  namespace: observability
+  labels: { app.kubernetes.io/name: prometheus-agent }
+spec:
+  replicas: 1
+  # Recreate: две реплики в момент обновления писали бы одни и те же серии дважды.
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app.kubernetes.io/name: prometheus-agent }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: prometheus-agent }
+    spec:
+      serviceAccountName: prometheus-agent
+      # Токен нужен kubernetes_sd и скрейпу cAdvisor; монтируется явно (том kube-api-access ниже) тем же путём,
+      # что и автоматический, — так видно, какому контейнеру он выдан.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        # Без fsGroup файл секрета с defaultMode 0400 принадлежит root и процессу nobody недоступен.
+        fsGroup: 65534
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: prometheus
+          image: cr.yandex/mirror/prom/prometheus:v2.46.0
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --enable-feature=agent
+            - --storage.agent.path=/data
+            - --web.listen-address=:9090
+          ports: [{ containerPort: 9090, name: http }]
+          volumeMounts:
+            - { name: config, mountPath: /etc/prometheus, readOnly: true }
+            - { name: data, mountPath: /data }
+            - { name: api-key, mountPath: /etc/monitoring, readOnly: true }
+            - { name: kube-api-access, mountPath: /var/run/secrets/kubernetes.io/serviceaccount, readOnly: true }
+          resources:
+            # ephemeral-storage покрывает emptyDir data (sizeLimit 1Gi) и лог контейнера.
+            requests: { cpu: "50m", memory: "128Mi", ephemeral-storage: "256Mi" }
+            limits: { cpu: "300m", memory: "512Mi", ephemeral-storage: "1536Mi" }
+          readinessProbe:
+            httpGet: { path: /-/ready, port: http }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /-/healthy, port: http }
+            periodSeconds: 15
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - name: config
+          configMap: { name: prometheus-agent-config }
+        - name: data
+          # WAL агента; при недоступном remote write растёт, лимит — чтобы упереться в eviction, а не в диск узла.
+          emptyDir: { sizeLimit: 1Gi }
+        - name: api-key
+          secret: { secretName: monitoring-api-key, defaultMode: 0400 }
+        - name: kube-api-access
+          projected:
+            sources:
+              - serviceAccountToken: { path: token, expirationSeconds: 3607 }
+              - configMap: { name: kube-root-ca.crt, items: [{ key: ca.crt, path: ca.crt }] }
+              - downwardAPI: { items: [{ path: namespace, fieldRef: { fieldPath: metadata.namespace } }] }

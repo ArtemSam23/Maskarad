@@ -1,0 +1,309 @@
+# Встроенный справочник типов персональных данных.
+#
+# Каждая запись — один тип. Типы `kind: pattern` полностью описаны здесь
+# (регулярные выражения по тексту в нижнем регистре, валидатор, контекст);
+# типы `kind: builtin` реализованы в коде, но их настройки (контекстные слова,
+# уверенность, приоритет, включённость) тоже берутся отсюда.
+#
+# Пользовательская конфигурация может переопределить любую запись по `id`
+# или добавить новые типы — ядро для этого менять не нужно.
+pii_types:
+  - id: EMAIL
+    description: Адрес электронной почты
+    patterns:
+      - '[a-z0-9а-я._%+\-]+@[a-z0-9а-я\-]+(?:\.[a-z0-9а-я\-]+)*\.(?:[a-z]{2,}|рф)'
+    digit_boundary: false
+    confidence: 0.98
+    priority: 100
+    group: contact
+
+  - id: PHONE
+    description: Номер телефона
+    patterns:
+      - '(?:\+7|(?-u:\b)[78])[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}(?-u:\b)'
+      - '\+\d{1,3}[\s\-]?\(?\d{2,4}\)?[\s\-]?\d{2,3}[\s\-]?\d{2,3}(?:[\s\-]?\d{2,3})?(?-u:\b)'
+      - '\(\d{3,5}\)[\s\-]?\d{2,3}[\s\-]?\d{2}[\s\-]?\d{2}(?-u:\b)'
+      - { regex: '(?-u:\b)\d{3}[\s\-]\d{2}[\s\-]\d{2}(?-u:\b)', requires_context: true, confidence: 0.8 }
+    validator: phone
+    context:
+      before: ['тел', 'телефон', 'моб', 'сот', 'звон', 'номер', 'phone', 'whatsapp', 'telegram', 'контакт', 'связ']
+      suppress: ['горяч\w+\s+лини', 'служб\w+\s+поддержки', 'колл-центр', 'call-центр', 'контакт-центр', 'справочн\w+\s+служб']
+    confidence: 0.92
+    priority: 80
+    group: contact
+
+  - id: INN
+    description: ИНН физического (12 цифр) или юридического (10 цифр) лица
+    patterns:
+      - '(?-u:\b)\d{12}(?-u:\b)'
+      - { regex: '(?-u:\b)\d{10}(?-u:\b)', requires_context: true }
+    validator: inn
+    soft_validator: true          # контекст «карта/ИНН/СНИЛС» важнее контрольной суммы
+    context:
+      before: ['инн', 'налогоплательщик', 'идентификационн\w+\s+номер']
+    confidence: 0.9
+    priority: 70
+    group: tax
+
+  - id: CARD_NUMBER
+    description: Номер платёжной банковской карты
+    patterns:
+      - '(?-u:\b)\d{4}[ \-]\d{4}[ \-]\d{4}[ \-]\d{2,7}(?-u:\b)'
+      - '(?-u:\b)\d{4}[ \-]\d{6}[ \-]\d{5}(?-u:\b)'
+      - '(?-u:\b)\d{13,19}(?-u:\b)'
+    validator: luhn
+    soft_validator: true          # контекст «карта/ИНН/СНИЛС» важнее контрольной суммы
+    context:
+      before: ['карт', 'card', 'номер', 'pan', 'visa', 'mastercard', 'мир']
+    confidence: 0.9
+    priority: 90
+    group: card
+
+  - id: CVV
+    description: CVV/CVC-код карты (только рядом с обозначением кода)
+    patterns:
+      - '(?:cvv2?|cvc2?|cvp2?|cvv[\s\-]?код\w*|cvc[\s\-]?код\w*|код\s+безопасности|код\s+на\s+обороте|три\s+цифры\s+на\s+обороте|защитн\w+\s+код\w*|security\s+code)\s*(?:карты|card)?\s*[:\-=]?\s*(?P<v>\d{3,4})(?-u:\b)'
+    confidence: 0.95
+    priority: 95
+    group: card
+
+  - id: PIN
+    description: ПИН-код карты (только рядом с обозначением кода)
+    patterns:
+      - '(?:пин[\s\-]?код\w*|пин|pin[\s\-]?code|pin)\s*(?:карты|от\s+карты|card)?\s*[:\-=]?\s*(?P<v>\d{4,6})(?-u:\b)'
+    confidence: 0.95
+    priority: 95
+    group: card
+
+  - id: CARD_EXPIRY
+    description: Срок действия карты
+    patterns:
+      - '(?:срок\s+действия|действительна\s+до|годна\s+до|valid\s+thru|exp(?:iry|ires|\.)?)\s*(?:карты)?\s*[:\-]?\s*(?P<v>(?:0[1-9]|1[0-2])\s?/\s?\d{2,4})(?-u:\b)'
+      - { regex: '(?-u:\b)(?P<v>(?:0[1-9]|1[0-2])/\d{2})(?-u:\b)', requires_context: true }
+    context:
+      before: ['карт', 'card', 'cvv', 'cvc']
+    weak: true
+    companions: [CARD_NUMBER, CVV]
+    confidence: 0.8
+    priority: 55
+    group: card
+
+  - id: PASSPORT
+    description: Серия и номер паспорта РФ
+    patterns:
+      - '(?:паспорт\w*|серия|сер\.)\s*(?:рф|гражданина\s+рф|гражданина\s+россии|россии)?\s*[:№#]?\s*(?P<v>\d{2}\s?\d{2}\s*(?:№|номер|n|no\.?|#)?\s*[:\-]?\s*\d{6})(?-u:\b)'
+      - { regex: '(?-u:\b)(?P<v>\d{2}\s?\d{2}[\s\-]\d{6})(?-u:\b)', confidence: 0.75 }
+      - { regex: '(?-u:\b)(?P<v>\d{10})(?-u:\b)', requires_context: true }
+    context:
+      before: ['паспорт', 'серия', 'сер\.', 'документ', 'удостоверени', 'пасп\.']
+      after: ['выдан', 'код\s+подразд']
+    confidence: 0.92
+    priority: 85
+    group: passport
+
+  - id: SUBDIVISION_CODE
+    description: Код подразделения, выдавшего паспорт
+    patterns:
+      - '(?:код\s+подразделения|код\s+подр\.?|к/п|кп)\s*[:\-]?\s*(?P<v>\d{3}[\s\-]?\d{3})(?-u:\b)'
+      - { regex: '(?-u:\b)(?P<v>\d{3}-\d{3})(?-u:\b)', confidence: 0.7 }
+    weak: true
+    companions: [PASSPORT, PASSPORT_ISSUER, PASSPORT_ISSUE_DATE]
+    context:
+      before: ['код\s+подразделения', 'код\s+подр', 'к/п', 'паспорт', 'выдан']
+    confidence: 0.95
+    priority: 86
+    group: passport
+
+  - id: DRIVER_LICENSE
+    description: Серия и номер водительского удостоверения
+    patterns:
+      - '(?:водительск\w*\s+удостоверени\w*|в/у|ву|вод\.\s*удост\.|права|удостоверени\w+\s+водителя|driver''?s?\s+licen[cs]e)\s*(?:№|номер|n)?\s*[:\-]?\s*(?P<v>\d{2}\s?(?:\d{2}|[а-я]{2}|[a-z]{2})\s?[№#]?\s?\d{6})(?-u:\b)'
+      - { regex: '(?-u:\b)(?P<v>\d{2}\s?[а-я]{2}\s?\d{6})(?-u:\b)', confidence: 0.8 }
+    context:
+      before: ['водительск', 'в/у', 'ву', 'права', 'удостоверени', 'driver']
+    confidence: 0.92
+    priority: 84
+    group: documents
+
+  - id: SNILS
+    description: СНИЛС
+    patterns:
+      - '(?-u:\b)(?P<v>\d{3}-\d{3}-\d{3}[\s\-]?\d{2})(?-u:\b)'
+      - { regex: '(?-u:\b)(?P<v>\d{11})(?-u:\b)', requires_context: true }
+    validator: snils
+    soft_validator: true          # контекст «карта/ИНН/СНИЛС» важнее контрольной суммы
+    context:
+      before: ['снилс', 'страхов\w+\s+номер', 'пенсионн']
+    confidence: 0.92
+    priority: 88
+    group: documents
+
+  - id: FOREIGN_PASSPORT
+    description: Заграничный паспорт РФ
+    patterns:
+      - '(?:загранпаспорт\w*|заграничн\w+\s+паспорт\w*|загран\.?\s*паспорт\w*|загран\w*)\s*(?:рф)?\s*[:№#]?\s*(?P<v>\d{2}\s?[№#]?\s?\d{7})(?-u:\b)'
+    confidence: 0.92
+    priority: 84
+    group: documents
+
+  - id: MILITARY_ID
+    description: Военный билет
+    patterns:
+      - '(?:военн\w+\s+билет\w*|воен\.?\s*билет\w*)\s*[:№#]?\s*(?P<v>[а-я]{2}\s?[№#]?\s?\d{6,7})(?-u:\b)'
+    confidence: 0.92
+    priority: 84
+    group: documents
+
+  - id: BIRTH_CERTIFICATE
+    description: Свидетельство о рождении
+    patterns:
+      - '(?:свидетельств\w+\s+о\s+рождении|св-во\s+о\s+рождении)\s*[:№#]?\s*(?P<v>[ivxlc]+[\s\-]?[а-я]{2}\s*[№#]?\s*\d{6})(?-u:\b)'
+    confidence: 0.92
+    priority: 84
+    group: documents
+
+  - id: RESIDENCE_PERMIT
+    description: Вид на жительство
+    patterns:
+      - '(?:внж|вид\s+на\s+жительство)\s*[:№#]?\s*(?P<v>\d{2}\s?[№#]?\s?\d{7})(?-u:\b)'
+    confidence: 0.92
+    priority: 84
+    group: documents
+
+  - id: OMS_POLICY
+    description: Полис ОМС
+    patterns:
+      - '(?:полис\w*\s*(?:омс)?|омс)\s*[:№#]?\s*(?P<v>\d{16})(?-u:\b)'
+    validator: { digits_len: { min: 16, max: 16 } }
+    confidence: 0.9
+    priority: 83
+    group: documents
+
+  - id: BANK_ACCOUNT
+    description: Номер банковского счёта (20 цифр)
+    patterns:
+      - '(?-u:\b)(?P<v>4(?:08|23|05|07|09|06|30|26|21)\d{2}\s?\d{3}\s?\d\s?\d{4}\s?\d{7})(?-u:\b)'
+    context:
+      before: ['счет', 'счёт', 'р/с', 'л/с', 'account', 'реквизит']
+    confidence: 0.88
+    priority: 89
+    group: bank
+
+  # ---- Типы, реализованные в коде (composite / gazetteer) ------------------
+
+  - id: FIO
+    description: Фамилия, имя, отчество
+    kind: builtin
+    context:
+      before: ['клиент', 'гражданин', 'гражданк', 'заявител', 'фио', 'ф\.и\.о', 'получател', 'отправител', 'плательщик', 'держател', 'на\s+имя', 'г-н', 'г-жа', 'господин', 'госпожа', 'сотрудник', 'заемщик', 'заёмщик', 'вкладчик', 'владелец', 'пациент', 'абонент', 'пользовател', 'покупател', 'продавец', 'арендатор', 'доверител', 'представител', 'зовут', 'имя', 'фамили', 'отчеств', 'уважаем']
+      suppress: ['поэт', 'писател', 'композитор', 'художник', 'учен', 'учён', 'актер', 'актёр', 'актрис', 'режиссер', 'режиссёр', 'император', 'царь', 'царица', 'княз', 'президент', 'генерал', 'маршал', 'полководец', 'философ', 'святой', 'изобретател', 'космонавт', 'музыкант', 'певец', 'певица', 'поэтесс', 'драматург', 'классик', 'автор', 'лауреат', 'академик', 'профессор', 'основател', 'памятник', 'имени', 'им\.', 'музей', 'театр', 'библиотек', 'улиц', 'площад', 'проспект', 'станци', 'метро']
+    confidence: 0.9
+    priority: 65
+    group: person
+
+  - id: CARD_HOLDER
+    description: Имя держателя карты (латиницей)
+    kind: builtin
+    context:
+      before: ['держател', 'holder', 'cardholder', 'card\s+holder', 'имя\s+на\s+карте', 'на\s+имя', 'владелец\s+карты', 'name']
+    confidence: 0.9
+    priority: 66
+    group: card
+
+  - id: BIRTH_DATE
+    description: Дата рождения
+    kind: builtin
+    context:
+      before: ['дата\s+рождения', 'д\.\s?р\.', 'д/р', 'родил(?:ся|ась|ись)', 'рожден', 'день\s+рождения', 'birth', 'born']
+      after: ['^\s*(?:г\.?\s?р\.?|года\s+рождения|г\.\s*рождения)']
+      window: 64
+    confidence: 0.95
+    priority: 60
+    group: person
+
+  - id: PASSPORT_ISSUE_DATE
+    description: Дата выдачи паспорта
+    kind: builtin
+    context:
+      before: ['выдан', 'дата\s+выдачи', 'выдач', 'issued']
+      window: 64
+    confidence: 0.95
+    priority: 60
+    group: passport
+
+  - id: DATE
+    description: Дата без явного контекста (маскируется при наличии других ПДн)
+    kind: builtin
+    weak: true
+    companions: [FIO, PASSPORT, BIRTH_PLACE, CITIZENSHIP, SNILS, INN, DRIVER_LICENSE, PASSPORT_ISSUER, SUBDIVISION_CODE]
+    confidence: 0.6
+    priority: 50
+    group: person
+
+  - id: BIRTH_PLACE
+    description: Место рождения
+    kind: builtin
+    context:
+      before: ['место\s+рождения', 'м\.\s?р\.', 'родил(?:ся|ась|ись)\s+в', 'родил(?:ся|ась|ись)\s+(?:\d{1,2}[./\-]\d{1,2}[./\-]\d{2,4}|\d{4}[./\-]\d{1,2}[./\-]\d{1,2}|\d{1,2}(?:-?го)?\s+[а-я]+\s+\d{4})\s*(?:г\.|года|г(?-u:\b))?\s*в', 'уроженец', 'уроженка', 'родом\s+из', 'place\s+of\s+birth']
+    confidence: 0.92
+    priority: 72
+    group: person
+
+  - id: CITIZENSHIP
+    description: Гражданство
+    kind: builtin
+    context:
+      before: ['гражданств', 'гражданин', 'гражданка', 'подданств', 'подданный', 'подданная', 'citizenship', 'nationality']
+    confidence: 0.92
+    priority: 72
+    group: passport
+
+  - id: PASSPORT_ISSUER
+    description: Орган, выдавший паспорт
+    kind: builtin
+    context:
+      before: ['выдан', 'кем\s+выдан', 'орган,?\s+выдавш', 'выдавш\w+\s+орган', 'issued\s+by']
+    confidence: 0.9
+    priority: 73
+    group: passport
+
+  - id: ADDRESS
+    description: Почтовый адрес целиком
+    kind: builtin
+    context:
+      before: ['адрес', 'прожива', 'зарегистрирован', 'прописан', 'регистраци', 'место\s+жительства', 'доставк', 'проживающ', 'зарегистрированн']
+      suppress: ['отделени', 'офис', 'филиал', 'банкомат', 'головн\w+\s+офис', 'до\s+№', 'дополнительн\w+\s+офис', 'представительств', 'магазин', 'пункт\s+выдачи', 'терминал']
+    confidence: 0.9
+    priority: 75
+    group: address
+
+  - id: ADDRESS_COUNTRY
+    kind: builtin
+    priority: 74
+    group: address
+  - id: ADDRESS_INDEX
+    kind: builtin
+    priority: 74
+    group: address
+  - id: ADDRESS_REGION
+    kind: builtin
+    priority: 74
+    group: address
+  - id: ADDRESS_CITY
+    description: Город (отдельно — только в адресном контексте)
+    kind: builtin
+    weak: true
+    priority: 74
+    group: address
+  - id: ADDRESS_STREET
+    kind: builtin
+    priority: 74
+    group: address
+  - id: ADDRESS_HOUSE
+    kind: builtin
+    priority: 74
+    group: address
+  - id: ADDRESS_APARTMENT
+    kind: builtin
+    priority: 74
+    group: address

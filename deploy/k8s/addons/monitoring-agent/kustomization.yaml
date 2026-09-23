@@ -1,0 +1,13 @@
+# kubectl kustomize deploy/k8s/addons/monitoring-agent | envsubst '$YC_PROMETHEUS_WORKSPACE_ID' | kubectl apply -f -
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - rbac.yaml
+  - deployment.yaml
+# Хеш-суффикс в имени ConfigMap: правка prometheus.yml меняет имя, Deployment перекатывается сам.
+# Prometheus не перечитывает конфиг на лету, без этого пришлось бы делать rollout restart руками.
+configMapGenerator:
+  - name: prometheus-agent-config
+    namespace: observability
+    files: [prometheus.yml]

@@ -1,0 +1,10 @@
+# helm upgrade --install cert-manager jetstack/cert-manager -n cert-manager --create-namespace \
+#   -f deploy/k8s/addons/cert-manager.values.yaml
+crds:
+  enabled: true
+resources:
+  requests: { cpu: "50m", memory: "64Mi" }
+# Метрики cert-manager никто не читает, а его ServiceMonitor требует CRD kube-prometheus-stack,
+# которого больше нет: с ним helm upgrade на свежем кластере падает.
+prometheus:
+  enabled: false

@@ -1,0 +1,25 @@
+# Локальный кластер (kind/minikube): Redis внутри кластера, секреты из примера.
+#   kubectl apply -k deploy/k8s/overlays/local
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: maskarad
+resources:
+  - namespace.yaml
+  - secret.yaml
+  - redis.yaml
+  - ../../base
+images:
+  - name: maskarad
+    newName: maskarad
+    newTag: local
+patches:
+  - target: { kind: Ingress, name: maskarad }
+    patch: |-
+      - op: replace
+        path: /spec/rules/0/host
+        value: maskarad.localtest.me
+      - op: replace
+        path: /spec/tls/0/hosts/0
+        value: maskarad.localtest.me
+      - op: remove
+        path: /metadata/annotations/cert-manager.io~1cluster-issuer

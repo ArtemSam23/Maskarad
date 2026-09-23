@@ -1,0 +1,566 @@
+# Эксплуатационные операции с кластером, которые не описываются Terraform.
+# recreate-node: узел выводится из работы (drain), его ВМ удаляется из группы узлов,
+#   группа создаёт новую ВМ; в конце — проверка /healthz с раннера (advisory).
+# recreate-ingress-lb: Service ingress-nginx удаляется (облако удаляет сетевой балансировщик)
+#   и создаётся заново через Helm с тем же статическим адресом; в конце та же проверка.
+# retry-tls: сертификат, который не выпущен, пересоздаётся — cert-manager начинает выпуск заново.
+# loadtest: нагрузочный прогон k6 из облака — временная группа узлов loadgen, Job с load/k6-process.js
+#   через публичный адрес, отчёт клиент + сервер (воркспейс Prometheus в Monium) в summary, вердикт PASS/FAIL/НЕПОЛНЫЙ
+#   (см. load/README.md).
+name: ops
+
+on:
+  workflow_dispatch:
+    # workflow_dispatch допускает не больше 10 inputs, все десять заняты. Новый параметр loadtest —
+    # только объединением существующих (например, расширением формата stages), не одиннадцатым полем.
+    inputs:
+      action:
+        description: Операция
+        type: choice
+        options: [retry-tls, recreate-ingress-lb, recreate-node, loadtest]
+        default: retry-tls
+      node:
+        description: Имя узла для recreate-node (kubectl get nodes)
+        required: false
+        default: ""
+      rps:
+        description: "loadtest: пар mask→demask в секунду (500 = 1000 запросов/с)"
+        default: "500"
+      duration:
+        description: "loadtest: длительность полки (5m, 300s)"
+        default: "5m"
+      stages:
+        description: "loadtest: ступени «длительность:пар/с,...» — если задано, rps и duration не используются"
+        default: ""
+      keepalive:
+        description: "loadtest: переиспользовать соединения (off — новое TLS-соединение на каждый запрос)"
+        type: boolean
+        default: true
+      big_per_10s:
+        description: "loadtest: больших пар (1×–16× корпуса) за 10 с параллельно; 0 — без них"
+        default: "0"
+      url:
+        description: "loadtest: адрес сервиса"
+        default: https://maskarad.tech
+      keep_loadgen:
+        description: "loadtest: не удалять группу узлов loadgen после прогона"
+        type: boolean
+        default: false
+      k6_version:
+        description: "loadtest: тег ghcr.io/grafana/k6"
+        default: "1.3.0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: infra
+  cancel-in-progress: false
+
+env:
+  YC_CLOUD_ID: ${{ vars.YC_CLOUD_ID || 'b1gt5hdhuc4hovu7kij9' }}
+  YC_FOLDER_ID: ${{ vars.YC_FOLDER_ID || 'b1gg8haq1qnfi8a272of' }}
+  # Та же версия, что в infra.yml: recreate-ingress-lb ставит чарт заново.
+  INGRESS_NGINX_CHART_VERSION: "4.15.1"
+
+jobs:
+  recreate-node:
+    if: inputs.action == 'recreate-node'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      NODE: ${{ inputs.node }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/yc
+        with:
+          sa-key: ${{ secrets.YC_SA_KEY_JSON }}
+          cloud-id: ${{ env.YC_CLOUD_ID }}
+          folder-id: ${{ env.YC_FOLDER_ID }}
+      - uses: azure/setup-kubectl@v4
+      - name: Kubeconfig
+        run: yc managed-kubernetes cluster get-credentials maskarad --external --force
+      - name: Locate the node in the instance group
+        id: locate
+        run: |
+          if [ -z "$NODE" ]; then echo "::error::input 'node' is required for recreate-node"; exit 1; fi
+          kubectl get node "$NODE" -o wide
+          ig=$(yc managed-kubernetes node-group get maskarad-workers --format json | jq -r .instance_group_id)
+          mid=$(yc compute instance-group list-instances "$ig" --format json | jq -r --arg n "$NODE" '.[] | select(.name == $n) | .id')
+          if [ -z "$mid" ]; then echo "::error::node $NODE is not in instance group $ig"; exit 1; fi
+          echo "instance group $ig, managed instance $mid"
+          echo "ig=$ig" >> "$GITHUB_OUTPUT"
+          echo "mid=$mid" >> "$GITHUB_OUTPUT"
+      - name: Drain
+        run: |
+          kubectl cordon "$NODE"
+          kubectl drain "$NODE" --ignore-daemonsets --delete-emptydir-data --timeout=5m
+      - name: Recreate the instance
+        run: |
+          yc compute instance-group delete-instances --id "${{ steps.locate.outputs.ig }}" \
+            --instance-ids "${{ steps.locate.outputs.mid }}" --create-another
+      - name: Wait for the replacement node
+        run: |
+          for i in $(seq 1 60); do
+            ready=$(kubectl get nodes --no-headers 2>/dev/null | awk '$2 == "Ready"' | grep -vc "^$NODE " || true)
+            gone=$(kubectl get node "$NODE" --no-headers 2>/dev/null | wc -l)
+            echo "attempt $i: ready nodes without $NODE = $ready, old node present = $gone"
+            if [ "$ready" -ge 2 ] && [ "$gone" -eq 0 ]; then break; fi
+            sleep 20
+          done
+          kubectl get nodes -o wide
+          kubectl get pods -A -o wide | grep -v Running || true
+      - name: Reachability from the runner (advisory)
+        # Путь с раннеров GitHub до балансировщика нестабилен, поэтому шаг не роняет job:
+        # он показывает, отвечает ли адрес, а не доказывает, что путь сломан.
+        run: |
+          ok=0
+          for i in 1 2 3 4 5; do
+            out=$(curl -sk -m 10 -o /dev/null -w "http=%{http_code} connect=%{time_connect}s" https://maskarad.tech/healthz 2>/dev/null) \
+              && ok=$((ok + 1)) || out="no answer (exit $?)"
+            echo "attempt $i: $out"
+          done
+          echo "$ok/5 answered"
+          [ "$ok" -gt 0 ] || echo "::warning::https://maskarad.tech/healthz did not answer from the GitHub runner"
+
+  recreate-ingress-lb:
+    if: inputs.action == 'recreate-ingress-lb'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/yc
+        with:
+          sa-key: ${{ secrets.YC_SA_KEY_JSON }}
+          cloud-id: ${{ env.YC_CLOUD_ID }}
+          folder-id: ${{ env.YC_FOLDER_ID }}
+      - uses: azure/setup-kubectl@v4
+      - uses: azure/setup-helm@v4
+      - name: Kubeconfig
+        run: yc managed-kubernetes cluster get-credentials maskarad --external --force
+      - name: Delete the ingress Service and its balancer
+        run: |
+          lbs() { yc load-balancer network-load-balancer list --format json | jq -r '.[] | select(.description | test("ingress-nginx/ingress-nginx-controller")) | .id'; }
+          echo "balancer before: $(lbs)"
+          kubectl -n ingress-nginx delete svc ingress-nginx-controller --wait=true --timeout=5m
+          for i in $(seq 1 30); do
+            left=$(lbs); [ -z "$left" ] && break
+            echo "attempt $i: balancer $left still exists"; sleep 10
+          done
+          echo "balancer after: $(lbs)"
+      - name: Re-create the Service through Helm
+        run: |
+          ip=$(yc vpc address get --name maskarad-ingress --format json | jq -r .external_ipv4_address.address)
+          echo "static address: $ip"
+          scripts/ingress_nginx_helm.sh "$ip"
+      - name: Wait for the new balancer and healthy targets
+        run: |
+          for i in $(seq 1 30); do
+            got=$(kubectl -n ingress-nginx get svc ingress-nginx-controller -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+            [ -n "$got" ] && { echo "balancer address: $got"; break; }
+            echo "attempt $i: no balancer address yet"; sleep 10
+          done
+          lb=$(yc load-balancer network-load-balancer list --format json | jq -r '.[] | select(.description | test("ingress-nginx/ingress-nginx-controller")) | .id')
+          tg=$(yc load-balancer network-load-balancer get "$lb" --format json | jq -r '.attached_target_groups[0].target_group_id')
+          for i in $(seq 1 30); do
+            states=$(yc load-balancer network-load-balancer target-states "$lb" --target-group-id "$tg" --format json | jq -r '.[].status' | sort | uniq -c | tr '\n' ' ')
+            echo "attempt $i: targets: $states"
+            echo "$states" | grep -q -E "UNHEALTHY|INITIAL|INACTIVE" || break
+            sleep 10
+          done
+          yc load-balancer network-load-balancer target-states "$lb" --target-group-id "$tg"
+      - name: Reachability from the runner (advisory)
+        # Путь с раннеров GitHub до балансировщика нестабилен, поэтому шаг не роняет job:
+        # он показывает, отвечает ли адрес, а не доказывает, что путь сломан.
+        run: |
+          ok=0
+          for i in 1 2 3 4 5; do
+            out=$(curl -sk -m 10 -o /dev/null -w "http=%{http_code} connect=%{time_connect}s" https://maskarad.tech/healthz 2>/dev/null) \
+              && ok=$((ok + 1)) || out="no answer (exit $?)"
+            echo "attempt $i: $out"
+          done
+          echo "$ok/5 answered"
+          [ "$ok" -gt 0 ] || echo "::warning::https://maskarad.tech/healthz did not answer from the GitHub runner"
+
+  retry-tls:
+    if: inputs.action == 'retry-tls'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/yc
+        with:
+          sa-key: ${{ secrets.YC_SA_KEY_JSON }}
+          cloud-id: ${{ env.YC_CLOUD_ID }}
+          folder-id: ${{ env.YC_FOLDER_ID }}
+      - uses: azure/setup-kubectl@v4
+      - name: Kubeconfig
+        run: yc managed-kubernetes cluster get-credentials maskarad --external --force
+      - name: Re-create the certificate if it is not ready
+        run: |
+          kubectl get certificates -A
+          ready=$(kubectl -n maskarad get certificate maskarad-tls -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "missing")
+          if [ "$ready" = "True" ]; then
+            echo "maskarad/maskarad-tls: ready, kept"
+          else
+            echo "maskarad/maskarad-tls: not ready ($ready), re-creating"
+            kubectl -n maskarad delete certificate maskarad-tls --ignore-not-found
+          fi
+      - name: Wait for issuance
+        run: |
+          for i in $(seq 1 36); do
+            notready=$(kubectl -n maskarad get certificates -o jsonpath='{range .items[*]}{.metadata.name}={.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' | grep -v '=True$' || true)
+            [ -z "$notready" ] && { echo "certificate maskarad-tls is ready"; break; }
+            echo "attempt $i: not ready: $(echo "$notready" | tr '\n' ' ')"; sleep 10
+          done
+          kubectl get certificates,orders,challenges -A
+
+  loadtest:
+    if: inputs.action == 'loadtest'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      RUN: ${{ github.run_id }}
+      # Номер попытки входит в TAG (payload_id): при Re-run run_id тот же, а payload_id с прошлой попытки
+      # ещё живут в хранилище (TTL 3600 с) — сервис ушёл бы в ветку demask без маскирования.
+      ATTEMPT: ${{ github.run_attempt }}
+      K6_VERSION: ${{ inputs.k6_version || '1.3.0' }}
+      RPS: ${{ inputs.rps || '500' }}
+      DURATION: ${{ inputs.duration || '5m' }}
+      STAGES_IN: ${{ inputs.stages }}
+      KEEPALIVE: ${{ inputs.keepalive && '1' || '0' }}
+      BIG_PER_10S: ${{ inputs.big_per_10s || '0' }}
+      URL: ${{ inputs.url || 'https://maskarad.tech' }}
+      KEEP_LOADGEN: ${{ inputs.keep_loadgen }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/yc
+        with:
+          sa-key: ${{ secrets.YC_SA_KEY_JSON }}
+          cloud-id: ${{ env.YC_CLOUD_ID }}
+          folder-id: ${{ env.YC_FOLDER_ID }}
+      - uses: azure/setup-kubectl@v4
+      - name: Kubeconfig
+        run: yc managed-kubernetes cluster get-credentials maskarad --external --force
+      - name: Plan
+        id: plan
+        run: |
+          set -euo pipefail
+          if [ -n "$STAGES_IN" ]; then stages="$STAGES_IN"; else stages="$DURATION:$RPS"; fi
+          total=0
+          for st in ${stages//,/ }; do
+            d="${st%%:*}"; n="${st##*:}"
+            [[ "$d" =~ ^[0-9]+[smh]?$ && "$n" =~ ^[0-9]+$ ]] || { echo "::error::bad stage '$st' (expected 5m:500)"; exit 1; }
+            case "$d" in *h) s=$(( ${d%h} * 3600 )) ;; *m) s=$(( ${d%m} * 60 )) ;; *s) s=${d%s} ;; *) s=$d ;; esac
+            total=$(( total + s ))
+          done
+          registry=$(yc container registry get --name maskarad --format json | jq -r .id)
+          # Хост из url — фильтр метрик ingress в серверном отчёте (метка host у nginx).
+          host=$(sed -E 's#^https?://##; s#[/:].*$##' <<<"$URL")
+          echo "stages $stages ($total s), keepalive $KEEPALIVE, big $BIG_PER_10S/10s, url $URL (host $host), k6 $K6_VERSION, registry $registry"
+          { echo "stages=$stages"; echo "seconds=$total"; echo "registry=$registry"; echo "host=$host"; } >> "$GITHUB_OUTPUT"
+      - name: Mirror the k6 image into cr.yandex
+        # Узлы кластера тянут ghcr.io и docker.io ненадёжно (ImagePullBackOff на новых узлах в прошлых
+        # прогонах), cr.yandex — стабильно. Раннер скачивает образ и кладёт его рядом с образом сервиса.
+        env:
+          REGISTRY: ${{ steps.plan.outputs.registry }}
+        run: |
+          set -euo pipefail
+          image="cr.yandex/$REGISTRY/k6:$K6_VERSION"
+          if yc container image list --repository-name "$REGISTRY/k6" --format json 2>/dev/null \
+               | jq -e --arg t "$K6_VERSION" 'any(.[]; .tags[]? == $t)' >/dev/null; then
+            echo "$image is already in the registry"
+          else
+            docker pull "ghcr.io/grafana/k6:$K6_VERSION"
+            docker tag "ghcr.io/grafana/k6:$K6_VERSION" "$image"
+            yc container registry configure-docker
+            docker push "$image"
+          fi
+          echo "IMAGE=$image" >> "$GITHUB_ENV"
+      - name: Ensure the loadgen node group
+        # Группа узлов не в Terraform намеренно: живёт только на время прогона и удаляется в шаге Cleanup
+        # (keep_loadgen=true оставляет её для серии прогонов). Taint role=loadgen не пускает на узел
+        # ничего, кроме генератора — в том числе DaemonSet ingress-nginx. Метка
+        # node.kubernetes.io/exclude-from-external-load-balancers не даёт CCM добавить узел в target group
+        # балансировщика ingress: с externalTrafficPolicy Cluster 1/(N+1) соединений шла бы через сам
+        # генератор. Подсеть и группа безопасности те же, что у maskarad-workers (infra/terraform/network.tf).
+        run: |
+          set -euo pipefail
+          create=1
+          if out=$(yc managed-kubernetes node-group get --name loadgen --format json 2>&1); then
+            status=$(jq -r .status <<<"$out")
+            case "$status" in
+              RUNNING|PROVISIONING|RECONCILING|STARTING)
+                echo "node group loadgen already exists ($status)"; create=0 ;;
+              DELETING)
+                # Cleanup прошлого прогона удаляет группу --async: без ожидания create отвечал бы «already exists».
+                for i in $(seq 1 60); do
+                  yc managed-kubernetes node-group get --name loadgen >/dev/null 2>&1 || break
+                  echo "attempt $i: node group loadgen is still DELETING"; sleep 10
+                done
+                if yc managed-kubernetes node-group get --name loadgen >/dev/null 2>&1; then
+                  echo "::error::node group loadgen is still being deleted after 10 minutes"; exit 1
+                fi ;;
+              *)
+                echo "::error::node group loadgen is in status $status — sort it out by hand: yc managed-kubernetes node-group get --name loadgen"; exit 1 ;;
+            esac
+          elif ! grep -q 'not found' <<<"$out"; then
+            echo "::error::yc managed-kubernetes node-group get failed: $out"; exit 1
+          fi
+          if [ "$create" = 1 ]; then
+            subnet=$(yc vpc subnet get --name maskarad-nodes-ru-central1-a --format json | jq -r .id)
+            sg=$(yc vpc security-group get --name maskarad-k8s --format json | jq -r .id)
+            # Версия узлов = версии мастера (без --version create берёт свою умолчательную и может отказать);
+            # диск network-hdd: генератору диск не нужен, а квота network-ssd занята рабочими узлами.
+            # Подсеть задаётся только в --network-interface: вместе с subnet-id в --location API отвечает
+            # «can't use allocation_policy.locations[0].subnet_id together with network_interface_specs».
+            # Комментарии внутри команды с переносами \ нельзя: bash обрывает на них список аргументов.
+            version=$(yc managed-kubernetes cluster get maskarad --format json | jq -r .master.version)
+            echo "creating node group loadgen: kubernetes $version, standard-v3 8 vCPU / 16 GiB, network-hdd 32 GiB"
+            yc managed-kubernetes node-group create --cluster-name maskarad --name loadgen \
+              --version "$version" \
+              --platform standard-v3 --cores 8 --memory 16 --core-fraction 100 \
+              --disk-type network-hdd --disk-size 32 --fixed-size 1 \
+              --location zone=ru-central1-a \
+              --network-interface subnets="$subnet",ipv4-address=nat,security-group-ids="$sg" \
+              --container-runtime containerd --auto-upgrade=false \
+              --node-labels role=loadgen,node.kubernetes.io/exclude-from-external-load-balancers=true \
+              --node-taints role=loadgen:NoSchedule
+          fi
+          ready=0
+          for i in $(seq 1 60); do
+            ready=$(kubectl get nodes -l role=loadgen --no-headers 2>/dev/null | awk '$2 == "Ready"' | wc -l | tr -d ' ')
+            [ "$ready" -ge 1 ] && break
+            echo "attempt $i: loadgen node is not Ready yet"; sleep 10
+          done
+          kubectl get nodes -l role=loadgen -o wide
+          [ "$ready" -ge 1 ] || { echo "::error::loadgen node did not become Ready in 10 minutes"; exit 1; }
+          # Узел не должен оказаться среди targets балансировщика ingress (см. комментарий к шагу).
+          node_ip=$(kubectl get nodes -l role=loadgen -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+          excl=$(kubectl get nodes -l role=loadgen -o jsonpath='{.items[0].metadata.labels.node\.kubernetes\.io/exclude-from-external-load-balancers}')
+          # Группа, оставленная старым прогоном (keep_loadgen) до появления метки, её не имеет — пересоздать.
+          [ "$excl" = "true" ] || echo "::warning::loadgen node has no node.kubernetes.io/exclude-from-external-load-balancers=true label (value '$excl'): an old node group? delete it and re-run"
+          lb=$(yc load-balancer network-load-balancer list --format json \
+                 | jq -r '.[] | select(.description | test("ingress-nginx/ingress-nginx-controller")) | .id' | head -1)
+          [ -n "$lb" ] || { echo "::error::ingress balancer not found (yc load-balancer network-load-balancer list) — cannot verify that the loadgen node is outside its target group"; exit 1; }
+          tgs=$(yc load-balancer network-load-balancer get "$lb" --format json | jq -r '.attached_target_groups[].target_group_id')
+          # CCM обновляет targets по событию узла; несколько проверок в течение минуты — на случай позднего добавления.
+          for i in 1 2 3 4; do
+            targets=$(for tg in $tgs; do yc load-balancer target-group get "$tg" --format json | jq -r '.targets[].address'; done)
+            if grep -qx "$node_ip" <<<"$targets"; then
+              echo "::error::loadgen node $node_ip is a target of the ingress balancer $lb: the CCM ignored node.kubernetes.io/exclude-from-external-load-balancers, so 1/(N+1) of the load would go through the generator itself. Options: externalTrafficPolicy=Local on the ingress-nginx Service for the run, or a generator outside the cluster."
+              exit 1
+            fi
+            echo "check $i: loadgen $node_ip is not among the balancer targets ($(tr '\n' ' ' <<<"$targets"))"
+            if [ "$i" -lt 4 ]; then sleep 15; fi
+          done
+      - name: Prepare the corpus and the scenario ConfigMap
+        run: |
+          set -euo pipefail
+          jq -c -n '[inputs | {text: .text}]' tests/golden/*.jsonl > load/corpus.json
+          files=(--from-file=k6-process.js=load/k6-process.js --from-file=corpus.json=load/corpus.json)
+          if awk -v b="$BIG_PER_10S" 'BEGIN { exit !(b > 0) }'; then
+            jq -r '.text' tests/golden/generated.jsonl | tr '\n' ' ' > load/bigtext.txt
+            files+=(--from-file=bigtext.txt=load/bigtext.txt)
+          fi
+          # bigtext.txt есть только при big_per_10s > 0: cat по отсутствующему файлу под pipefail молча ронял шаг.
+          size=0
+          for f in load/k6-process.js load/corpus.json load/bigtext.txt; do
+            [ -f "$f" ] && size=$(( size + $(wc -c < "$f") ))
+          done
+          echo "scenario + data: $size bytes"
+          [ "$size" -lt 900000 ] || { echo "::error::ConfigMap payload $size bytes is over the 1 MiB limit"; exit 1; }
+          for i in $(seq 1 30); do
+            phase=$(kubectl get namespace loadtest -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+            [ "$phase" = "Terminating" ] || break
+            echo "attempt $i: namespace loadtest is still terminating"; sleep 5
+          done
+          kubectl get namespace loadtest >/dev/null 2>&1 || kubectl create namespace loadtest
+          kubectl -n loadtest delete configmap loadtest-scenario --ignore-not-found
+          kubectl -n loadtest create configmap loadtest-scenario "${files[@]}"
+      - name: Run k6
+        id: k6
+        env:
+          STAGES: ${{ steps.plan.outputs.stages }}
+          PLANNED: ${{ steps.plan.outputs.seconds }}
+        run: |
+          set -uo pipefail
+          export DEADLINE=$(( PLANNED + 300 ))
+          envsubst '$IMAGE $RUN $ATTEMPT $URL $STAGES $KEEPALIVE $BIG_PER_10S $DEADLINE' < deploy/k8s/tools/loadtest-job.yaml > job.yaml
+          # Рестарты за прогон — kubectl'ом (kube-state-metrics в кластере нет): сумма restartCount до и после.
+          restarts() { local n; n=$(kubectl -n "$1" get pods -o json 2>/dev/null | jq '[.items[].status.containerStatuses[]?.restartCount] | add // 0'); echo "${n:-0}"; }
+          r0_maskarad=$(restarts maskarad); r0_ingress=$(restarts ingress-nginx)
+          kubectl -n loadtest delete job "k6-$RUN" --ignore-not-found
+          applied=$(date +%s)
+          kubectl apply -f job.yaml || { echo "::error::kubectl apply -f job.yaml failed — see the output above"; exit 1; }
+          pod() { kubectl -n loadtest get pods -l "job-name=k6-$RUN" -o jsonpath="$1" 2>/dev/null || true; }
+          deadline=$(( applied + DEADLINE + 120 )); status=""
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            succeeded=$(kubectl -n loadtest get job "k6-$RUN" -o jsonpath='{.status.succeeded}' 2>/dev/null || true)
+            failed=$(kubectl -n loadtest get job "k6-$RUN" -o jsonpath='{.status.failed}' 2>/dev/null || true)
+            if [ "${succeeded:-0}" -ge 1 ] 2>/dev/null; then status=succeeded; break; fi
+            if [ "${failed:-0}" -ge 1 ] 2>/dev/null; then status=failed; break; fi
+            echo "$(date -u +%H:%M:%S) $(pod '{.items[0].status.phase}') $(pod '{.items[0].status.initContainerStatuses[0].state.waiting.reason}') $(pod '{.items[0].status.containerStatuses[0].state.waiting.reason}') $(kubectl -n loadtest logs "job/k6-$RUN" -c k6 --tail=3 2>/dev/null | grep -E '^pairs' | tail -1)"
+            sleep 15
+          done
+          echo "job k6-$RUN: ${status:-timeout}"
+          kubectl -n loadtest logs "job/k6-$RUN" --all-containers > k6.log 2>&1 || true
+          sed -n '/^===K6_SUMMARY_BEGIN===$/,/^===K6_SUMMARY_END===$/p' k6.log | sed '1d;$d' > k6-summary.json
+          # Без сводки нет ни окна серверного отчёта, ни вердикта. Файл удаляется, чтобы следующие шаги
+          # (условие hashFiles) не стартовали на пустом: jq и awk падали бы на нём с невнятными ошибками.
+          if ! jq -e '.run_start_ms and .run_end_ms' k6-summary.json >/dev/null 2>&1; then
+            echo "::error::k6 summary (with run_start_ms/run_end_ms) is missing from the job log (job ${status:-timeout})"
+            rm -f k6-summary.json
+            kubectl -n loadtest describe job "k6-$RUN" | tail -30 || true
+            tail -50 k6.log || true
+            exit 1
+          fi
+          # Окно серверного отчёта — из сводки k6: сам прогон, без планирования пода, pull образа и init VU.
+          start=$(jq -r '.run_start_ms / 1000 | floor' k6-summary.json)
+          end=$(jq -r '.run_end_ms / 1000 | ceil' k6-summary.json)
+          # Под, ушедший при scale-down HPA, уносит свой счётчик — разница может уйти в минус, клампим к 0.
+          r_maskarad=$(( $(restarts maskarad) - r0_maskarad )); [ "$r_maskarad" -ge 0 ] || r_maskarad=0
+          r_ingress=$(( $(restarts ingress-nginx) - r0_ingress )); [ "$r_ingress" -ge 0 ] || r_ingress=0
+          { echo "start=$start"; echo "end=$end"; echo "status=${status:-timeout}"
+            echo "restarts_maskarad=$r_maskarad"; echo "restarts_ingress=$r_ingress"; } >> "$GITHUB_OUTPUT"
+          echo "window $start..$end ($(( end - start )) s), restarts during the run: maskarad $r_maskarad, ingress-nginx $r_ingress"
+          sed -n '/^maskarad loadtest/,/^===K6_SUMMARY_BEGIN===$/p' k6.log | sed '$d'
+      - name: Client-side summary (k6)
+        # hashFiles, а не outputs шага: без сводки шаг не должен стартовать вовсе (jq падал на пустом файле).
+        if: always() && hashFiles('k6-summary.json') != ''
+        env:
+          RESTARTS_MASKARAD: ${{ steps.k6.outputs.restarts_maskarad }}
+          RESTARTS_INGRESS: ${{ steps.k6.outputs.restarts_ingress }}
+        run: |
+          set -euo pipefail
+          jq -r --arg rm "$RESTARTS_MASKARAD" --arg ri "$RESTARTS_INGRESS" '
+            def n($d): if . == null then "-" else (. * pow(10; $d) | round / pow(10; $d) | tostring) end;
+            def row($name; $t): "| \($name) | \($t.p50 | n(1)) | \($t.p90 | n(1)) | \($t.p95 | n(1)) | \($t.p99 | n(1)) | \($t.p999 | n(1)) | \($t.max | n(0)) |";
+            "## Клиент: k6 \(.tag), \(.url), ступени \(.stages), keep-alive \(if .keepalive then "on" else "off" end), большие тексты \(.big_per_10s)/10 с",
+            "",
+            "| Показатель | Значение |", "|---|---:|",
+            "| Длительность | план \(.planned_seconds) с, факт \(.duration_seconds | n(1)) с (с gracefulStop) |",
+            "| Пар (итераций) | \(.iterations) из \(.expected_pairs) по плану (\(if .expected_pairs > 0 then .iterations / .expected_pairs * 100 else 0 end | n(1)) %) |",
+            "| Запросов | \(.http_reqs) (\(.actual_rps | n(1))/с по плановой длительности, цель \(.target_rps_avg | n(0))/с) |",
+            "| Невалидных ответов (не 200 и не 429) | \(.invalid_responses) (таймаутов \(.timeouts)) |",
+            "| 429 / ретраев | \(.rate_limited) / \(.retries) (\(if .http_reqs > 0 then .rate_limited / .http_reqs * 100 else 0 end | n(2)) % запросов) |",
+            "| Пар не завершено за 3 попытки | \(.pair_failed) |",
+            "| Демаскирование ≠ оригинал | \(.demask_mismatch) |",
+            "| dropped_iterations (не хватило VU) | \(.dropped_iterations) |",
+            "| VU max / HTTP/1.1 | \(.vus_max) / \((.proto_http1 // 0) * 100 | n(2)) % |",
+            "| Первая попытка 200: mask / demask | \((.mask_first_try_ok // 0) * 100 | n(2)) % / \((.demask_first_try_ok // 0) * 100 | n(2)) % |",
+            "| Рестарты подов за прогон (kubectl): maskarad / ingress-nginx | \($rm) / \($ri) |",
+            "",
+            "| Latency, мс | p50 | p90 | p95 | p99 | p99.9 | max |", "|---|---:|---:|---:|---:|---:|---:|",
+            row("mask"; .mask_latency_ms), row("demask"; .demask_latency_ms), row("пара с ретраями"; .pair_latency_ms),
+            row("TLS handshake"; .tls_handshake_ms),
+            (if .big then
+              "", "Большие тексты — информационно, в вердикт не входят; счётчики отдельные от основного потока.",
+              "", "| Большие тексты | mask p50 | mask p95 | mask max | demask p50 | demask p95 |", "|---|---:|---:|---:|---:|---:|",
+              (.big.sizes | to_entries[] | "| \(.key) | \(.value.mask_ms.p50 | n(0)) | \(.value.mask_ms.p95 | n(0)) | \(.value.mask_ms.max | n(0)) | \(.value.demask_ms.p50 | n(0)) | \(.value.demask_ms.p95 | n(0)) |"),
+              "", "Больших пар \(.big.pairs): не завершено за 3 попытки \(.big.pair_failed), невалидных ответов \(.big.invalid) (таймаутов \(.big.timeouts)), 429 / ретраев \(.big.rate_limited) / \(.big.retries), несовпадений \(.big.mismatch), первых попыток дольше 10 с \(.big.over_10s).",
+              (if (.big.thresholds_failed | length) > 0 then "Пороги большого потока не пройдены (справочно): \(.big.thresholds_failed | join("; "))" else empty end)
+             else empty end),
+            (if (.thresholds_failed | length) > 0 then "", "Пороги k6 не пройдены: \(.thresholds_failed | join("; "))" else empty end),
+            ""
+          ' k6-summary.json | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Server-side report (Monium)
+        if: always() && hashFiles('k6-summary.json') != ''
+        env:
+          START: ${{ steps.k6.outputs.start }}
+          END: ${{ steps.k6.outputs.end }}
+          STAGES: ${{ steps.plan.outputs.stages }}
+          INGRESS_HOST: ${{ steps.plan.outputs.host }}
+          RESTARTS_MASKARAD: ${{ steps.k6.outputs.restarts_maskarad }}
+          RESTARTS_INGRESS: ${{ steps.k6.outputs.restarts_ingress }}
+          YC_PROMETHEUS_WORKSPACE_ID: ${{ vars.YC_PROMETHEUS_WORKSPACE_ID || secrets.YC_PROMETHEUS_WORKSPACE_ID }}
+        run: |
+          set -uo pipefail
+          if [ -z "$YC_PROMETHEUS_WORKSPACE_ID" ]; then
+            echo "::error::YC_PROMETHEUS_WORKSPACE_ID (variable or secret) is empty — set the Prometheus workspace id (infra/README.md, «Воркспейс Prometheus»); without it there is no server-side report and the verdict is incomplete"
+            exit 1
+          fi
+          # Токен для API воркспейса скрипт берёт сам: yc iam create-token (yc настроен шагом yc).
+          echo "source: Monium Prometheus workspace $YC_PROMETHEUS_WORKSPACE_ID, ingress host $INGRESS_HOST"
+          sleep 45   # последние точки окна должны доехать до Monitoring (интервал скрейпа 30 с + remote write)
+          args=()
+          [ -z "$STAGES_IN" ] || args=(--stages "$STAGES")
+          rc=0
+          scripts/loadtest_report.sh "$START" "$END" "loadtest $RUN" --kv server.kv "${args[@]}" | tee server-report.md >> "$GITHUB_STEP_SUMMARY" || rc=$?
+          # Рестарты считает шаг Run k6; в server.kv — чтобы artifact и вердикт видели их рядом с метриками.
+          { echo "restarts_maskarad=$RESTARTS_MASKARAD"; echo "restarts_ingress=$RESTARTS_INGRESS"; } >> server.kv
+          [ "$rc" -eq 0 ] || { echo "::error::server-side report failed (exit $rc) — the verdict will be incomplete, see the step log"; exit "$rc"; }
+      - name: Verdict
+        if: always() && hashFiles('k6-summary.json') != ''
+        run: |
+          set -uo pipefail
+          s=k6-summary.json
+          get() { jq -r "$1" "$s"; }
+          # Значение из server.kv; "-" (нет данных) и "(ошибка)" (запрос не удался) считаются отсутствием.
+          kv() { grep -s "^$1=" server.kv | cut -d= -f2- | grep -v -E '^(-|\(ошибка\))$' || true; }
+          pct() { awk "BEGIN { printf \"%.2f\", ($2 > 0 ? 100 * $1 / $2 : 0) }"; }
+          invalid=$(get .invalid_responses); mismatch=$(get .demask_mismatch); pair_failed=$(get .pair_failed)
+          rate_limited=$(get .rate_limited); http_reqs=$(get .http_reqs); proto_http1=$(get '.proto_http1 // 0')
+          iterations=$(get .iterations); expected=$(get .expected_pairs); dropped=$(get .dropped_iterations)
+          actual_rps=$(get '.actual_rps // 0'); target_rps=$(get '.target_rps_avg // 0')
+          client_p99=$(jq -r '[.mask_latency_ms.p99, .demask_latency_ms.p99] | map(select(. != null)) | max // empty | . / 1000 | . * 10000 | round / 10000' "$s")
+          p99_200=$(kv ingress_p99_200_s); p99_all=$(kv ingress_p99_s); mask_p99=$(kv service_mask_p99_s)
+          restarts_m=$(kv restarts_maskarad); restarts_i=$(kv restarts_ingress)
+          fail=""; incomplete=""
+          check() { if awk "BEGIN { exit !($1) }"; then echo "- PASS: $2"; else echo "- **FAIL**: $2"; fail=1; fi; }
+          missing() { echo "- **НЕПОЛНЫЙ**: $1"; incomplete=1; }
+          # Блок пишется в файл, а не в пайп на tee: в пайпе он выполнился бы в subshell, и fail не дошёл бы сюда.
+          {
+            echo "## Вердикт"
+            echo
+            check "$invalid == 0" "невалидных ответов (не 200 и не 429): $invalid"
+            check "$mismatch == 0" "демаскирование ≠ оригинал: $mismatch"
+            check "$pair_failed == 0" "пар не завершено за 3 попытки: $pair_failed"
+            # Порог 1 %: проверяющая ретраит 429 по Retry-After, но заметная доля сброшенной нагрузки значит,
+            # что сервис не тянет, а не что лимит настроен.
+            check "$http_reqs > 0 && $rate_limited <= 0.01 * $http_reqs" "429: $rate_limited из $http_reqs запросов ($(pct "$rate_limited" "$http_reqs") %, порог 1 %)"
+            # GODEBUG=http2client=0 в Job — единственная защита от h2; новая версия k6 может её молча снять.
+            check "$proto_http1 >= 0.999" "HTTP/1.1: $(pct "$proto_http1" 1) % ответов (≥ 99.9 %, как у проверяющей)"
+            # Гейт по latency — только серверный p99 по status=200. Клиентский p99 не заменяет его: без серверных
+            # данных вердикт неполный, а не PASS на верхней оценке.
+            if [ -n "$p99_200" ]; then
+              check "$p99_200 < 0.5" "ingress p99 по status=200 (nginx, сервер): $p99_200 с (< 0.5 с); по всем статусам ${p99_all:-нет данных}"
+            else
+              missing "серверных данных нет, гейт по latency не проверен"
+            fi
+            echo "- справочно: p99 mask/demask у клиента ${client_p99:-нет данных} с (с сетью и TLS); рестарты подов за прогон: maskarad ${restarts_m:-?}, ingress-nginx ${restarts_i:-?}"
+            if [ -n "$p99_200" ] && [ -z "$mask_p99" ]; then
+              missing "серверный отчёт не видел запросов mask (service_mask_p99_s пуст): прогон мерил только demask — payload_id повторились (правило про TAG в load/README.md) или метрики сервиса не собраны"
+            fi
+            check "$iterations >= 0.95 * $expected" "пар выполнено $iterations из $expected по плану ($(awk "BEGIN { printf \"%.1f\", ($expected > 0 ? 100 * $iterations / $expected : 0) }") %; $(printf '%.0f' "$actual_rps") запросов/с при цели $(printf '%.0f' "$target_rps"))"
+            check "$dropped < 0.001 * ($iterations + $dropped)" "dropped_iterations: $dropped (< 0.1 % итераций)"
+            echo
+            if [ -n "$fail" ]; then echo "**FAIL**"; elif [ -n "$incomplete" ]; then echo "**НЕПОЛНЫЙ**"; else echo "**PASS**"; fi
+          } > verdict.md
+          cat verdict.md | tee -a "$GITHUB_STEP_SUMMARY"
+          [ -z "$fail" ] || { echo "::error::loadtest FAIL — см. summary"; exit 1; }
+          [ -z "$incomplete" ] || { echo "::error::loadtest НЕПОЛНЫЙ — серверных данных не хватает, гейт не проверен; причина в summary"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: loadtest-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            k6.log
+            k6-summary.json
+            server-report.md
+            server.kv
+            verdict.md
+            job.yaml
+          if-no-files-found: ignore
+      - name: Cleanup
+        # Группа loadgen удаляется всегда, кроме keep_loadgen: узел стоит денег и без прогона не нужен.
+        if: always()
+        run: |
+          kubectl -n loadtest delete job "k6-$RUN" --ignore-not-found --wait=false || true
+          kubectl delete namespace loadtest --ignore-not-found --wait=false || true
+          if [ "$KEEP_LOADGEN" = "true" ]; then
+            echo "node group loadgen is kept (keep_loadgen) and costs money; delete it by hand: yc managed-kubernetes node-group delete --cluster-name maskarad --name loadgen"
+          elif yc managed-kubernetes node-group get --name loadgen >/dev/null 2>&1; then
+            yc managed-kubernetes node-group delete --name loadgen --async \
+              || echo "::warning::node group loadgen was not deleted — delete it by hand, it costs money: yc managed-kubernetes node-group delete --cluster-name maskarad --name loadgen"
+          fi

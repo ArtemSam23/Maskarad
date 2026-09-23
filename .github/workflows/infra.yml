@@ -1,0 +1,269 @@
+# Инфраструктура в Яндекс Облаке: Terraform + аддоны кластера (ingress-nginx, cert-manager,
+# агент Prometheus → Managed Prometheus, Fluent Bit → Monium Logs). План — на каждый PR,
+# применение — после merge в main с одобрением в environment `infrastructure`.
+name: infra
+
+on:
+  pull_request:
+    paths: ["infra/**", "deploy/k8s/addons/**", "scripts/monium_dashboard.sh", ".github/workflows/infra.yml", ".github/actions/yc/**"]
+  push:
+    branches: [main]
+    paths: ["infra/**", "deploy/k8s/addons/**", "scripts/monium_dashboard.sh", ".github/workflows/infra.yml", ".github/actions/yc/**"]
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Что выполнить
+        type: choice
+        default: apply
+        options: [plan, apply, addons]
+      replace:
+        description: "Адрес ресурса для пересоздания при apply (terraform -replace), например yandex_kubernetes_cluster.main"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: infra
+  cancel-in-progress: false
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "0"
+  TF_DIR: infra/terraform
+  AWS_ACCESS_KEY_ID: ${{ secrets.YC_S3_ACCESS_KEY }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.YC_S3_SECRET_KEY }}
+  STATE_BUCKET: maskarad-tfstate-${{ vars.YC_FOLDER_ID || 'b1gg8haq1qnfi8a272of' }}
+  # Версия чарта ingress-nginx (controller 1.15.1). Меняется здесь и в ops.yml одновременно;
+  # scripts/ingress_nginx_helm.sh копирует образы именно этой версии в Container Registry.
+  INGRESS_NGINX_CHART_VERSION: "4.15.1"
+
+jobs:
+  plan:
+    name: terraform plan
+    if: github.event_name == 'pull_request' || inputs.action == 'plan'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/yc
+        with:
+          sa-key: ${{ secrets.YC_SA_KEY_JSON }}
+          cloud-id: ${{ vars.YC_CLOUD_ID || 'b1gt5hdhuc4hovu7kij9' }}
+          folder-id: ${{ vars.YC_FOLDER_ID || 'b1gg8haq1qnfi8a272of' }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+          terraform_wrapper: false
+      - name: Ensure state bucket
+        run: yc storage bucket get --name "$STATE_BUCKET" >/dev/null 2>&1 || yc storage bucket create --name "$STATE_BUCKET" --default-storage-class standard
+      - run: terraform -chdir=$TF_DIR init -backend-config="bucket=$STATE_BUCKET"
+      - run: terraform -chdir=$TF_DIR validate
+      - name: Plan
+        shell: bash
+        run: |
+          terraform -chdir=$TF_DIR plan -no-color -out=tfplan | tee plan.txt
+          { echo '## Terraform plan'; echo '```'; tail -c 60000 plan.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+  apply:
+    name: terraform apply
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || inputs.action == 'apply'
+    runs-on: ubuntu-latest
+    environment: infrastructure
+    outputs:
+      ingress_ip: ${{ steps.out.outputs.ingress_ip }}
+      cluster_name: ${{ steps.out.outputs.cluster_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/yc
+        with:
+          sa-key: ${{ secrets.YC_SA_KEY_JSON }}
+          cloud-id: ${{ vars.YC_CLOUD_ID || 'b1gt5hdhuc4hovu7kij9' }}
+          folder-id: ${{ vars.YC_FOLDER_ID || 'b1gg8haq1qnfi8a272of' }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+          terraform_wrapper: false
+      - name: Ensure state bucket
+        run: yc storage bucket get --name "$STATE_BUCKET" >/dev/null 2>&1 || yc storage bucket create --name "$STATE_BUCKET" --default-storage-class standard
+      - run: terraform -chdir=$TF_DIR init -backend-config="bucket=$STATE_BUCKET"
+      - run: terraform -chdir=$TF_DIR validate
+      - name: Apply
+        env:
+          REPLACE: ${{ inputs.replace }}
+        run: |
+          extra=""
+          if [ -n "$REPLACE" ]; then extra="-replace=$REPLACE"; echo "Recreating $REPLACE"; fi
+          terraform -chdir=$TF_DIR apply -auto-approve -no-color $extra
+      - name: Outputs
+        id: out
+        run: |
+          echo "ingress_ip=$(terraform -chdir=$TF_DIR output -raw ingress_ip)" >> "$GITHUB_OUTPUT"
+          echo "cluster_name=$(terraform -chdir=$TF_DIR output -raw cluster_name)" >> "$GITHUB_OUTPUT"
+          {
+            echo '## Инфраструктура'
+            echo "- Кластер: \`$(terraform -chdir=$TF_DIR output -raw cluster_name)\` (\`$(terraform -chdir=$TF_DIR output -raw cluster_id)\`)"
+            echo "- Образы: \`$(terraform -chdir=$TF_DIR output -raw image_repository)\`"
+            echo "- Адрес балансировщика: \`$(terraform -chdir=$TF_DIR output -raw ingress_ip)\`"
+            echo "- Redis: \`$(terraform -chdir=$TF_DIR output -raw redis_host)\`"
+            echo "- NS у регистратора: ns1.yandexcloud.net, ns2.yandexcloud.net"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  addons:
+    name: cluster addons
+    needs: [apply]
+    if: always() && (needs.apply.result == 'success' || inputs.action == 'addons')
+    runs-on: ubuntu-latest
+    env:
+      # Почта для Let's Encrypt: принимается и как secret, и как variable.
+      LETSENCRYPT_EMAIL: ${{ secrets.LETSENCRYPT_EMAIL || vars.LETSENCRYPT_EMAIL || 'admin@maskarad.tech' }}
+      # Воркспейс Prometheus создаётся вручную в UI Monium (ни Terraform, ни API для этого нет), его id — в Variables.
+      YC_PROMETHEUS_WORKSPACE_ID: ${{ vars.YC_PROMETHEUS_WORKSPACE_ID || secrets.YC_PROMETHEUS_WORKSPACE_ID }}
+    steps:
+      - name: Check YC_PROMETHEUS_WORKSPACE_ID
+        # Первым шагом, до kubeconfig и до удаления старого стека: без воркспейса агенту некуда писать,
+        # а сносить kube-prometheus-stack и остаться без метрик вовсе — хуже, чем не начинать.
+        run: |
+          if [ -z "$YC_PROMETHEUS_WORKSPACE_ID" ]; then
+            echo "::error::GitHub variable YC_PROMETHEUS_WORKSPACE_ID is empty — create a Prometheus workspace in Monium (monium.yandex.cloud: Поставка и хранение → Prometheus → Создать воркспейс) and put its id into Settings → Secrets and variables → Actions → Variables (see infra/README.md)"
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/yc
+        with:
+          sa-key: ${{ secrets.YC_SA_KEY_JSON }}
+          cloud-id: ${{ vars.YC_CLOUD_ID || 'b1gt5hdhuc4hovu7kij9' }}
+          folder-id: ${{ vars.YC_FOLDER_ID || 'b1gg8haq1qnfi8a272of' }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+          terraform_wrapper: false
+      - uses: azure/setup-kubectl@v4
+      - uses: azure/setup-helm@v4
+      - name: Terraform outputs
+        # API-ключи агентов — во временные файлы с правами 600, а не в GITHUB_ENV: их читает только kubectl.
+        run: |
+          set -euo pipefail
+          terraform -chdir=$TF_DIR init -backend-config="bucket=$STATE_BUCKET" >/dev/null
+          terraform -chdir=$TF_DIR output -json | jq -e 'has("monium_logs_api_key")' >/dev/null \
+            || { echo "::error::в state нет ключа Monium — сначала Actions → infra → apply"; exit 1; }
+          out() { terraform -chdir=$TF_DIR output -raw "$1"; }
+          {
+            echo "INGRESS_IP=$(out ingress_ip)"
+            echo "CLUSTER_NAME=$(out cluster_name)"
+          } >> "$GITHUB_ENV"
+          for key in monitoring_api_key monium_logs_api_key; do
+            file="$RUNNER_TEMP/$key"
+            install -m 600 /dev/null "$file"
+            value="$(out "$key")"
+            [ -n "$value" ] || { echo "::error::terraform output $key is empty"; exit 1; }
+            echo "::add-mask::$value"
+            printf '%s' "$value" > "$file"
+          done
+          {
+            echo "MONITORING_API_KEY_FILE=$RUNNER_TEMP/monitoring_api_key"
+            echo "MONIUM_API_KEY_FILE=$RUNNER_TEMP/monium_logs_api_key"
+          } >> "$GITHUB_ENV"
+      - name: Kubeconfig
+        run: yc managed-kubernetes cluster get-credentials "$CLUSTER_NAME" --external --force
+      - name: Wait for the Kubernetes API
+        # Сразу после создания кластера внешний endpoint мастера может несколько минут не отвечать.
+        run: |
+          for i in $(seq 1 30); do
+            if kubectl version --request-timeout=15s >/dev/null 2>&1; then echo "API is up"; exit 0; fi
+            echo "attempt $i: API not reachable yet"; sleep 20
+          done
+          echo "::error::Kubernetes API did not become reachable in 10 minutes"
+          yc managed-kubernetes cluster get "$CLUSTER_NAME" --format yaml | grep -E "status|health|external_v4|endpoint" || true
+          exit 1
+      - name: Wait for ingress-nginx after node changes
+        # После пересоздания узлов admission-webhook ingress-nginx поднимается не сразу,
+        # а обновление чартов с Ingress-ресурсами ходит в него.
+        run: |
+          if kubectl -n ingress-nginx get deployment ingress-nginx-controller >/dev/null 2>&1; then
+            kubectl -n ingress-nginx rollout status deployment/ingress-nginx-controller --timeout=5m || true
+          fi
+      - name: Helm repositories
+        run: |
+          helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+          helm repo add jetstack https://charts.jetstack.io
+          helm repo update
+      - name: cert-manager
+        run: |
+          helm upgrade --install cert-manager jetstack/cert-manager -n cert-manager --create-namespace \
+            -f deploy/k8s/addons/cert-manager.values.yaml --wait --timeout 10m
+      - name: ingress-nginx (pinned chart, images mirrored into Container Registry)
+        run: scripts/ingress_nginx_helm.sh "$INGRESS_IP"
+      - name: Cluster issuers
+        # HTTP-01: валидаторы Let's Encrypt ходят на балансировщик; DNS-01 не используется.
+        run: envsubst '$LETSENCRYPT_EMAIL' < deploy/k8s/addons/cluster-issuer.yaml | kubectl apply -f -
+      - name: Remove the in-cluster monitoring stack and the staging namespace
+        # Метрики и логи ушли в Monium: kube-prometheus-stack, Loki и Promtail
+        # отбирали у сервиса ~1.5 vCPU и 2 ГБ на узлах 2 vCPU. PVC Prometheus и Loki удаляются вместе
+        # с namespace, данные за 7 дней теряются — так и задумано. CRD kube-prometheus-stack
+        # (ServiceMonitor и др.) helm uninstall не трогает, они остаются в кластере.
+        run: |
+          for release in monitoring loki promtail; do
+            if helm status "$release" -n monitoring >/dev/null 2>&1; then
+              helm uninstall "$release" -n monitoring --wait --timeout 5m || true
+            fi
+          done
+          kubectl delete namespace monitoring --ignore-not-found --wait=false
+          # Окружение staging упразднено (overlay и DNS-запись удалены из репозитория); namespace
+          # с его подами и сертификатом никто больше не обновляет, убираем вместе со старым стеком.
+          kubectl delete namespace maskarad-staging --ignore-not-found --wait=false
+      - name: Prometheus agent → Managed Prometheus
+        # Агент только снимает /metrics и шлёт remote write в воркспейс Prometheus; хранение,
+        # графики и алерты — в Monium. Воркспейс создаётся вручную в UI Monium, API для этого нет.
+        # Namespace observability создаёт этот шаг, поэтому Fluent Bit ставится после него.
+        run: |
+          set -euo pipefail
+          kubectl create namespace observability --dry-run=client -o yaml | kubectl apply -f -
+          kubectl -n observability create secret generic monitoring-api-key \
+            --from-file=api-key="$MONITORING_API_KEY_FILE" --dry-run=client -o yaml | kubectl apply -f -
+          kubectl kustomize deploy/k8s/addons/monitoring-agent | envsubst '$YC_PROMETHEUS_WORKSPACE_ID' | kubectl apply -f -
+          kubectl -n observability rollout status deployment/prometheus-agent --timeout=3m
+          kubectl -n observability logs deploy/prometheus-agent --tail=50 | grep -iE 'error|remote' || true
+      - name: Fluent Bit → Monium
+        # DaemonSet из deploy/k8s/addons/fluent-bit (kustomize, образ по digest из cr.yandex/mirror).
+        # Не зависит от успеха шага метрик: логи — требование ТЗ, namespace создаётся здесь же.
+        # Ключ Fluent Bit читает в env только при старте. Хеш ключа в аннотации шаблона пода перекатывает
+        # DaemonSet при смене ключа и доводит состояние на повторном прогоне, если прошлый упал между
+        # Secret и рестартом: со старым ключом Monium отвечает 401, а 4xx выход не повторяет.
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          kubectl create namespace observability --dry-run=client -o yaml | kubectl apply -f -
+          kubectl -n observability create secret generic monium-api-key \
+            --from-file=api-key="$MONIUM_API_KEY_FILE" --dry-run=client -o yaml | kubectl apply -f -
+          kubectl kustomize deploy/k8s/addons/fluent-bit | envsubst '$YC_FOLDER_ID' | kubectl apply -f -
+          key_sha=$(sha256sum "$MONIUM_API_KEY_FILE" | cut -c1-16)
+          kubectl -n observability patch daemonset fluent-bit --type merge \
+            -p "{\"spec\":{\"template\":{\"metadata\":{\"annotations\":{\"maskarad.tech/api-key-sha\":\"$key_sha\"}}}}}"
+          kubectl -n observability rollout status daemonset/fluent-bit --timeout=5m
+          # Fluent Bit из Marketplace (namespace logging) — если его ставила
+          # прежняя версия этого workflow. Удаляется после того, как новый агент поднялся.
+          if helm status fluent-bit -n logging >/dev/null 2>&1; then
+            helm uninstall fluent-bit -n logging --wait --timeout 5m
+          fi
+          kubectl delete namespace logging --ignore-not-found --wait=false
+      - name: Monium dashboard
+        # Дашборд из deploy/grafana/dashboards: серверная конвертация Grafana JSON в Monium.
+        # API конвертера не описан в документации и может измениться, а дашборд не на критическом
+        # пути, поэтому шаг не роняет job; упавший шаг виден в UI.
+        # Правки дашборда workflow не запускают (их нет в on.paths): после изменения
+        # deploy/grafana/dashboards импорт — Actions → infra → addons.
+        continue-on-error: true
+        run: bash scripts/monium_dashboard.sh deploy/grafana/dashboards/maskarad.json
+      - name: Summary
+        run: |
+          {
+            echo '## Аддоны кластера'
+            echo "- Балансировщик: $(kubectl -n ingress-nginx get svc ingress-nginx-controller -o jsonpath='{.status.loadBalancer.ingress[0].ip}')"
+            echo "- Метрики и дашборд: https://monium.yandex.cloud/projects/folder__$YC_FOLDER_ID"
+            echo "- Логи: https://monium.yandex.cloud/projects/folder__$YC_FOLDER_ID/logs"
+            echo '```'
+            kubectl get clusterissuer -o wide
+            kubectl -n observability get pods -o wide
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

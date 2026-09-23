@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = ["crates/maskarad-core", "crates/maskarad"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/ArtemSam23/Maskarad"
+rust-version = "1.80"
+
+[workspace.dependencies]
+maskarad-core = { path = "crates/maskarad-core" }
+regex = "1"
+aho-corasick = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+thiserror = "2"
+anyhow = "1"
+sha2 = "0.10"
+hmac = "0.12"
+rand = "0.8"
+rand_chacha = "0.3"
+tracing = "0.1"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+panic = "unwind"
+strip = true
+
+[profile.bench]
+inherits = "release"

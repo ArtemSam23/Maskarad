@@ -1,0 +1,10 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: maskarad
+spec:
+  # Не более одного пода одновременно при drain/обновлении узлов; в отличие от minAvailable
+  # не зависит от текущего числа реплик HPA и не блокирует drain при одной реплике (overlay local).
+  maxUnavailable: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: maskarad }

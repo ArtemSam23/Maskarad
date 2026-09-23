@@ -1,0 +1,3 @@
+# Генерируются из tests/golden перед прогоном (см. README.md), в репозиторий не кладутся.
+corpus.json
+bigtext.txt

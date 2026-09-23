@@ -1,0 +1,47 @@
+name: Yandex Cloud CLI
+description: Installs the yc CLI, authenticates with a service account key and exports it for Terraform
+inputs:
+  sa-key:
+    description: Service account authorized key (JSON)
+    required: true
+  cloud-id:
+    required: true
+  folder-id:
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Install yc
+      shell: bash
+      run: |
+        set -euo pipefail
+        curl -sSL https://storage.yandexcloud.net/yandexcloud-yc/install.sh | bash -s -- -i "$HOME/yandex-cloud" -n >/dev/null
+        echo "$HOME/yandex-cloud/bin" >> "$GITHUB_PATH"
+    - name: Authenticate
+      shell: bash
+      env:
+        SA_KEY: ${{ inputs.sa-key }}
+        CLOUD_ID: ${{ inputs.cloud-id }}
+        FOLDER_ID: ${{ inputs.folder-id }}
+      run: |
+        set -euo pipefail
+        if [ -z "$SA_KEY" ]; then
+          echo "::error::GitHub secret YC_SA_KEY_JSON is empty — add the service account authorized key (Settings → Secrets and variables → Actions)"; exit 1
+        fi
+        if [ -z "$CLOUD_ID" ] || [ -z "$FOLDER_ID" ]; then
+          echo "::error::cloud-id/folder-id are empty"; exit 1
+        fi
+        key="$RUNNER_TEMP/yc-sa-key.json"
+        install -m 600 /dev/null "$key"
+        printf '%s' "$SA_KEY" > "$key"
+        yc config profile create ci >/dev/null 2>&1 || yc config profile activate ci
+        yc config set service-account-key "$key"
+        yc config set cloud-id "$CLOUD_ID"
+        yc config set folder-id "$FOLDER_ID"
+        yc config set format json
+        {
+          echo "YC_SERVICE_ACCOUNT_KEY_FILE=$key"
+          echo "YC_CLOUD_ID=$CLOUD_ID"
+          echo "YC_FOLDER_ID=$FOLDER_ID"
+        } >> "$GITHUB_ENV"
+        echo "yc: cloud $(yc config get cloud-id), folder $(yc config get folder-id)"

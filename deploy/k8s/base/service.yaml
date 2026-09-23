@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: maskarad
+  labels: { app.kubernetes.io/name: maskarad }
+spec:
+  selector: { app.kubernetes.io/name: maskarad }
+  ports: [{ name: http, port: 80, targetPort: http }]

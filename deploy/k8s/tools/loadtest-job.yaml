@@ -1,0 +1,71 @@
+# Job генератора k6 для Actions → ops → loadtest. Подставляются envsubst:
+# IMAGE — зеркало k6 в cr.yandex, RUN — id запуска, ATTEMPT — номер попытки (github.run_attempt),
+# URL, STAGES, KEEPALIVE, BIG_PER_10S — параметры сценария load/k6-process.js, DEADLINE — длительность
+# прогона + запас, с. Сценарий и корпус приходят ConfigMap'ом loadtest-scenario (k6-process.js,
+# corpus.json, bigtext.txt).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: k6-${RUN}
+  namespace: loadtest
+  labels: { app: k6, run: "${RUN}" }
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: ${DEADLINE}
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels: { app: k6, run: "${RUN}" }
+    spec:
+      restartPolicy: Never
+      nodeSelector: { role: loadgen }
+      tolerations:
+        - { key: role, operator: Equal, value: loadgen, effect: NoSchedule }
+      # Сеть узла напрямую: без keep-alive генератор открывает тысячи соединений в секунду, и conntrack
+      # узла (по умолчанию 131072 записей при TIME_WAIT 120 с) переполняется за ~50 с — «table full,
+      # dropping packet». Лимиты conntrack глобальные, из pod-netns их не поднять; initContainer ниже
+      # выставляет их на узле (privileged), а k6 в host-netns ими пользуется. Узел выделен генератору
+      # (taint role=loadgen), поэтому host network никому не мешает.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      automountServiceAccountToken: false
+      initContainers:
+        - name: sysctl
+          # Тот же образ, что у k6 (alpine, sysctl из busybox): второй образ узлу тянуть не нужно.
+          image: ${IMAGE}
+          command: ["sh", "-ec"]
+          args:
+            - |
+              sysctl -w net.netfilter.nf_conntrack_max=1048576 \
+                        net.netfilter.nf_conntrack_tcp_timeout_time_wait=30 \
+                        net.ipv4.ip_local_port_range="1024 65535"
+          securityContext: { privileged: true, runAsUser: 0 }
+      containers:
+        - name: k6
+          image: ${IMAGE}
+          workingDir: /scenario
+          args: ["run", "--summary-trend-stats", "avg,min,med,p(90),p(95),p(99),p(99.9),max", "/scenario/k6-process.js"]
+          env:
+            - { name: URL, value: "${URL}" }
+            - { name: STAGES, value: "${STAGES}" }
+            - { name: KEEPALIVE, value: "${KEEPALIVE}" }
+            - { name: BIG_PER_10S, value: "${BIG_PER_10S}" }
+            # Метка уникальна и между попытками одного запуска (Re-run): при повторе run_id тот же,
+            # payload_id совпали бы с прошлой попыткой и сервис ушёл бы в ветку demask без маскирования.
+            - { name: TAG, value: "gh-${RUN}-${ATTEMPT}" }
+            - { name: LOG_MISMATCH, value: "1" }
+            - { name: K6_NO_USAGE_REPORT, value: "true" }
+            # Проверяющая ходит по HTTP/1.1 (Python requests); без этого Go договорится об h2 через ALPN,
+            # и режим без keep-alive не покажет цену TLS-рукопожатий на ingress. Вердикт проверяет
+            # долю HTTP/1.1 в ответах: новая версия k6 может молча перестать уважать GODEBUG.
+            - { name: GODEBUG, value: "http2client=0" }
+          resources:
+            # limits.cpu = все 8 vCPU узла loadgen: узел выделен генератору, квота CFS не меньше ёмкости узла,
+            # поэтому троттлинга, который дал бы хвосты в клиентской latency, нет.
+            requests: { cpu: "6", memory: "2Gi", ephemeral-storage: "256Mi" }
+            limits: { cpu: "8", memory: "12Gi", ephemeral-storage: "1Gi" }
+          volumeMounts:
+            - { name: scenario, mountPath: /scenario, readOnly: true }
+      volumes:
+        - name: scenario
+          configMap: { name: loadtest-scenario }

@@ -1,0 +1,11 @@
+/target
+**/*.rs.bk
+*.zip
+.env
+*.log
+/dist
+/.idea
+/.vscode
+__pycache__/
+# кэш scripts/monium_dashboard.sh (grpcurl) при запуске вне CI
+/.cache

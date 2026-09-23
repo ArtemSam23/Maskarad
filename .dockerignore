@@ -1,0 +1,8 @@
+target
+dist
+.git
+docs
+tests
+load
+deploy
+*.zip

@@ -1,0 +1,49 @@
+# Локальный стенд: сервис + Redis + Prometheus + Grafana.
+#   docker compose -f deploy/docker-compose.yml up --build
+# UI: http://localhost:8080  Grafana: http://localhost:3000 (admin/admin)  Prometheus: http://localhost:9090
+services:
+  maskarad:
+    build:
+      context: ..
+    ports:
+      - "8080:8080"
+    environment:
+      MASKARAD_STORE: redis
+      REDIS_URL: redis://redis:6379/0
+      MASKARAD_STORE_KEY: ${MASKARAD_STORE_KEY:-change-me-store-key}
+      MASKARAD_SECRET: ${MASKARAD_SECRET:-change-me-masking-secret}
+      MASKARAD_ADMIN_KEY: ${MASKARAD_ADMIN_KEY:-admin-demo-key}
+      MASKARAD_DEMO_MODE: "true"
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      MASKARAD_LOG_FORMAT: json
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "512mb", "--maxmemory-policy", "allkeys-lru"]
+    ports:
+      - "6379:6379"
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus

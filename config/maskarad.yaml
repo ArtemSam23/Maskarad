@@ -1,0 +1,102 @@
+# Конфигурация Maskarad. Значения вида ${VAR:-default} подставляются из окружения.
+#
+# Подключение системы-потребителя: добавьте запись в `systems` с её `id`, ключом
+# (`auth.api_keys`), перечнем типов ПДн (`pii_types`), флагом `demask` и профилем
+# маскирования (`profile`); `enabled: false` отключает доступ. Новый тип ПДн —
+# запись в `pii_types` (регулярное выражение, контекст, валидатор) без правки кода.
+# Ловушки (публичные персоны, адреса отделений, корпоративные телефоны) — в
+# `allowlists`. Файл перечитывается на лету; ошибочная версия не применяется.
+
+server:
+  listen: "${MASKARAD_LISTEN:-0.0.0.0:8080}"
+  max_body_bytes: 4194304
+  # Потолок одновременных запросов на процесс (все полосы вместе, ждущие большие тексты тоже), защита
+  # по памяти. Сверх него и сверх адаптивного лимита — сразу 429 RATE_LIMITED с Retry-After: 1.
+  max_inflight: 2048
+  request_timeout_ms: 8000
+  admission:
+    enabled: true        # false — один статический лимит max_inflight, как раньше
+    min_limit: 8         # адаптивный лимит коротких запросов не опускается ниже
+    # large_limit: 2     # больших текстов (тело больше blocking_threshold_bytes) в обработке одновременно, остальные ждут; по умолчанию — число CPU
+    target_ms: 5         # цель по средней задержке коротких запросов при нехватке CPU (docs/design.md, §12.1)
+
+store:
+  backend: ${MASKARAD_STORE:-memory}          # memory | redis
+  redis_url: "${REDIS_URL:-redis://127.0.0.1:6379/0}"
+  ttl_seconds: 3600
+  encryption_key: "${MASKARAD_STORE_KEY:-}"   # base64 32 байта или парольная фраза; обязателен для redis
+  memory_fallback: true                       # только на старте: без Redis реплика поднимается на памяти и помечается degraded
+  timeout_ms: 1000                            # таймаут одной команды Redis; после таймаута — один повтор
+  memory_capacity_bytes: 268435456            # память процесса под соответствия (L1-кэш / backend memory), 256 MiB
+
+llm:
+  base_url: "${LLM_BASE_URL:-}"               # любой OpenAI-совместимый API, например http://ollama:11434/v1
+  api_key: "${LLM_API_KEY:-}"
+  timeout_ms: 60000
+
+admin:
+  api_key: "${MASKARAD_ADMIN_KEY:-}"
+
+logging:
+  format: ${MASKARAD_LOG_FORMAT:-json}
+  level: ${MASKARAD_LOG_LEVEL:-info}
+
+ui:
+  enabled: true
+  allow_system_override: ${MASKARAD_DEMO_MODE:-true}   # демо: /v1/* принимает поле "system" без ключа
+
+masking:
+  secret: "${MASKARAD_SECRET:-}"              # общий секрет реплик для стратегий token/synthetic
+
+detection:
+  context_window: 48
+  min_confidence: 0.5
+
+allowlists:
+  public_addresses:
+    - "г. Москва, ул. Каланчёвская, д. 27"
+  public_phones:
+    - "8 800 200-00-00"
+  corporate_email_domains:
+    - "alfabank.ru"
+
+# Пример расширения справочника типов без правки кода.
+pii_types:
+  - id: EMPLOYEE_ID
+    description: "Табельный номер сотрудника"
+    patterns: ['(?:^|[^а-яa-z0-9])(?P<v>тн-?\d{6})(?-u:\b)']   # группа v — значение; префикс вместо \b перед кириллицей
+    context: { before: ['табельн', 'сотрудник'] }
+    confidence: 0.9
+    priority: 60
+    group: hr
+
+systems:
+  - id: alfasonar
+    description: "Проверяющая система (контракт /process, без ключа)"
+    auth: { anonymous: true }
+    pii_types: all
+    exclude_types: [EMPLOYEE_ID]
+    demask: true
+    profile: reference
+
+  - id: support-chatbot
+    description: "Чат-бот поддержки, ходит в LLM через прокси"
+    auth: { api_keys: ["${SUPPORT_BOT_KEY:-demo-support-key}"] }
+    pii_types: all
+    demask: true
+    profile: placeholder
+    combination_rules:
+      - { mask: PIN, only_if_present: [CARD_NUMBER] }
+
+  - id: analytics
+    description: "Аналитика: синтетика вместо ПДн, демаскирование запрещено"
+    auth: { api_keys: ["${ANALYTICS_KEY:-demo-analytics-key}"] }
+    pii_types: [FIO, PHONE, EMAIL, CARD_NUMBER, PASSPORT, ADDRESS, BIRTH_DATE, INN, SNILS]
+    demask: false
+    profile: synthetic
+
+  - id: legacy-crm
+    description: "Отключённая система — доступ запрещён"
+    enabled: false
+    auth: { api_keys: ["${LEGACY_KEY:-demo-legacy-key}"] }
+    profile: full

@@ -1,0 +1,24 @@
+[package]
+name = "maskarad-core"
+description = "PII detection, masking and demasking engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+regex.workspace = true
+aho-corasick.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+proptest = "1"
+serde_json.workspace = true

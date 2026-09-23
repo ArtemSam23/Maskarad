@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Maskarad — модуль безопасности персональных данных</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 32 32%27%3E%3Crect width=%2732%27 height=%2732%27 rx=%276%27 fill=%27%23c8102e%27/%3E%3Ctext x=%2716%27 y=%2722%27 font-size=%2718%27 text-anchor=%27middle%27 fill=%27white%27 font-family=%27sans-serif%27 font-weight=%27bold%27%3EM%3C/text%3E%3C/svg%3E">
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#1c1e21; --muted:#6b7280; --line:#e5e7eb; --accent:#c8102e; --ok:#15803d; --warn:#b45309; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif; background:var(--bg); color:var(--ink); }
+  header { display:flex; align-items:center; gap:16px; padding:14px 24px; background:#fff; border-bottom:1px solid var(--line); }
+  header h1 { font-size:18px; margin:0; }
+  header .sub { color:var(--muted); font-size:13px; }
+  .status { font-size:13px; color:var(--muted); }
+  .status b { color:var(--ok); }
+  .status b.bad { color:var(--accent); }
+  .docs-link { margin-left:auto; color:var(--ink); text-decoration:none; font-size:13px; padding:6px 12px; border:1px solid var(--line); border-radius:8px; }
+  .docs-link:hover { border-color:var(--accent); color:var(--accent); }
+  main { display:grid; grid-template-columns: 1fr 1fr; gap:16px; padding:16px 24px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
+  .card h2 { font-size:14px; margin:0 0 10px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
+  textarea { width:100%; min-height:150px; font:14px/1.45 inherit; padding:10px; border:1px solid var(--line); border-radius:8px; resize:vertical; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-top:10px; }
+  button { font:14px inherit; padding:8px 14px; border-radius:8px; border:1px solid var(--line); background:#fff; cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button:disabled { opacity:.5; cursor:default; }
+  select, input[type=text] { font:14px inherit; padding:7px 10px; border:1px solid var(--line); border-radius:8px; background:#fff; }
+  .out { font:14px/1.6 inherit; white-space:pre-wrap; overflow-wrap:anywhere; padding:10px; border:1px dashed var(--line); border-radius:8px; min-height:44px; background:#fafafa; }
+  mark { padding:1px 4px; border-radius:4px; background:#fde68a; }
+  .m { padding:1px 4px; border-radius:4px; background:#dbeafe; }
+  .visually-hidden { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:5px 6px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:600; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; font-weight:600; color:#fff; }
+  .meta { color:var(--muted); font-size:12px; margin-top:6px; }
+  .err { color:var(--accent); font-size:13px; white-space:pre-wrap; }
+  .wide { grid-column: 1 / -1; }
+  footer { padding:10px 24px 24px; color:var(--muted); font-size:12px; }
+  footer a { color:inherit; }
+  @media (max-width: 1000px) { main { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Maskarad</h1>
+    <div class="sub">Система-потребитель → идентификация → маскирование → LLM → демаскирование → потребитель</div>
+  </div>
+  <a class="docs-link" href="/docs" target="_blank">API docs</a>
+  <div class="status" id="status">проверка состояния…</div>
+</header>
+<main>
+  <section class="card">
+    <h2>1. Исходный текст запроса к LLM</h2>
+    <textarea id="text" aria-label="Исходный текст запроса">Клиент Иванов Иван Иванович, дата рождения 12.05.1987, паспорт серия 45 09 номер 123456, выдан ОВД района Хамовники г. Москвы 15.06.2010, код подразделения 770-001. Адрес: 101000, г. Москва, ул. Тверская, д. 7, кв. 12. Телефон +7 (925) 123-45-67, email ivanov.ivan@mail.ru, ИНН 500100732259. Карта 4111 1111 1111 1111, CVV 123, держатель IVAN IVANOV.
+Поэт Александр Пушкин родился 6 июня 1799 года в Москве, а отделение банка на ул. Каланчёвская, д. 27 работает до 20:00.</textarea>
+    <div class="row">
+      <label>Система-потребитель <select id="system"></select></label>
+      <label>API-ключ <input type="text" id="apikey" placeholder="необязательно в демо-режиме" size="24"></label>
+    </div>
+    <div class="row">
+      <select id="examples" aria-label="Примеры текстов"><option value="">Примеры…</option></select>
+      <button id="btnDetect">Найти ПДн</button>
+      <button id="btnMask" class="primary">Замаскировать</button>
+      <button id="btnLlm">Отправить в LLM через прокси</button>
+    </div>
+    <div class="err" id="error"></div>
+  </section>
+
+  <section class="card">
+    <h2>2. Найденные персональные данные</h2>
+    <div class="out" id="highlight">—</div>
+    <div class="meta" id="detectMeta"></div>
+    <table id="entities"><caption class="visually-hidden">Найденные сущности</caption><thead><tr><th>Тип</th><th>Фрагмент</th><th>Уверенность</th><th>Основание</th><th>Маска</th></tr></thead><tbody></tbody></table>
+  </section>
+
+  <section class="card">
+    <h2>3. Что уходит в модель (замаскированный текст)</h2>
+    <div class="out" id="masked">—</div>
+    <div class="meta" id="maskMeta"></div>
+    <div class="row">
+      <button id="btnDemask">Демаскировать этот текст обратно</button>
+      <span class="meta">payload_id: <code id="payloadId">—</code></span>
+    </div>
+    <div class="out" id="demasked" style="margin-top:8px">—</div>
+    <div class="meta" id="demaskMeta"></div>
+  </section>
+
+  <section class="card">
+    <h2>4. Ответ LLM</h2>
+    <div class="meta">Модель получает только замаскированный текст; ответ демаскируется, если системе это разрешено.</div>
+    <div class="out" id="llmMasked" style="margin-top:8px">—</div>
+    <div class="meta">↑ ответ модели как есть (с плейсхолдерами) · ↓ ответ после демаскирования</div>
+    <div class="out" id="llmDemasked" style="margin-top:8px">—</div>
+    <div class="meta" id="llmMeta"></div>
+  </section>
+
+  <section class="card wide">
+    <h2>5. Настройки систем-потребителей (из конфигурации, только чтение)</h2>
+    <table id="systems"><caption class="visually-hidden">Системы-потребители</caption><thead><tr><th>id</th><th>Описание</th><th>Включена</th><th>Профиль маски</th><th>Демаскирование</th><th>Типы ПДн</th><th>Слабые сущности</th><th>Правила комбинаций</th></tr></thead><tbody></tbody></table>
+  </section>
+</main>
+<footer>
+  <a href="/metrics" target="_blank">/metrics</a> · <a href="/readyz" target="_blank">/readyz</a> · <a href="/v1/types" target="_blank">/v1/types</a> · <a href="/v1/profiles" target="_blank">/v1/profiles</a> · API: <code>POST /process</code>, <code>POST /v1/mask</code>, <code>POST /v1/demask</code>, <code>POST /v1/detect</code>, <code>POST /v1/chat/completions</code>
+</footer>
+<script>
+const $ = (id) => document.getElementById(id);
+const COLORS = {};
+const PALETTE = ["#c8102e","#1d4ed8","#047857","#b45309","#7c3aed","#0e7490","#be185d","#4d7c0f","#9333ea","#dc2626","#0369a1","#a16207","#15803d","#6d28d9","#b91c1c","#065f46","#1e40af","#9f1239"];
+function color(type) {
+  if (!COLORS[type]) COLORS[type] = PALETTE[Object.keys(COLORS).length % PALETTE.length];
+  return COLORS[type];
+}
+const EXAMPLES = [
+  ["Все типы ПДн в одном запросе", $("text").value],
+  ["Регистр и форматы дат", "иванов иван иванович родился 5 марта 1990 года, паспорт 4509123456, ИНН 500100732259. Дата выдачи: 2010.15.06; д.р. 1990-03-05; двенадцатого мая тысяча девятьсот восемьдесят седьмого года."],
+  ["Разделяющие слова", "Паспорт серия 45 09 номер 123456, выдан Отделом УФМС России по Московской области в г. Мытищи, дата выдачи 15.06.2010, код подразделения 770-001."],
+  ["Ловушка: публичная персона", "Поэт Александр Пушкин родился 6 июня 1799 года в Москве. Композитор Пётр Ильич Чайковский — в Воткинске."],
+  ["Ловушка: адрес отделения банка", "Отделение банка по адресу г. Москва, ул. Каланчёвская, д. 27 работает до 20:00, горячая линия 8 800 200-00-00."],
+  ["Ловушка: даты и города без контекста", "Отчёт за 01.09.2026 готов. В Москве и Санкт-Петербурге открылись новые офисы."],
+  ["Карта: только PIN vs PIN + номер", "Пин-код 1234. Карта 4111 1111 1111 1111, пин-код 1234, CVV 123, срок действия 12/27."],
+  ["Диалог для LLM (плейсхолдеры)", "Здравствуйте! Меня зовут Петров Пётр Петрович, мой телефон +7 925 123-45-67. Петрова Петра Петровича нужно перезвонить на 89251234567 завтра. Второй контакт — Сидорова Анна Сергеевна, anna@mail.ru."],
+  ["Документы кроме паспорта РФ", "СНИЛС 112-233-445 95, загранпаспорт 71 1234567, водительское удостоверение 77 АА 123456, полис ОМС 1234567890123456, военный билет АБ 1234567."],
+];
+for (const [name, text] of EXAMPLES) { const o = document.createElement("option"); o.value = text; o.textContent = name; $("examples").appendChild(o); }
+$("examples").onchange = () => { if ($("examples").value) $("text").value = $("examples").value; };
+
+function headers() {
+  const h = { "Content-Type": "application/json" };
+  const k = $("apikey").value.trim();
+  if (k) h["X-API-Key"] = k;
+  return h;
+}
+function systemField() { return $("apikey").value.trim() ? {} : { system: $("system").value }; }
+async function call(path, body) {
+  const t0 = performance.now();
+  const res = await fetch(path, { method: "POST", headers: headers(), body: JSON.stringify(body) });
+  const ms = (performance.now() - t0).toFixed(1);
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(`${res.status} ${json.error ? json.error.code + ": " + json.error.message : ""}`);
+  return { json, ms, rid: res.headers.get("X-Request-Id") };
+}
+function escapeHtml(s) { return s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+function bytesToChars(text) {
+  // Entities use UTF-8 byte offsets; build a byte→char index map.
+  const enc = new TextEncoder(); const map = []; let b = 0; let i = 0;
+  for (const ch of text) {
+    const len = enc.encode(ch).length;
+    for (let j = 0; j < len; j++) map[b + j] = i;
+    b += len;
+    i += ch.length;
+  }
+  map[b] = text.length; return map;
+}
+function highlight(text, entities) {
+  const map = bytesToChars(text); let out = ""; let cursor = 0;
+  for (const e of [...entities].sort((a, b) => a.start - b.start)) {
+    const s = map[e.start], en = map[e.end];
+    out += escapeHtml(text.slice(cursor, s));
+    out += `<mark style="background:${color(e.type)}22;outline:1px solid ${color(e.type)}" title="${e.type} · ${e.evidence}">${escapeHtml(text.slice(s, en))}</mark>`;
+    cursor = en;
+  }
+  return out + escapeHtml(text.slice(cursor));
+}
+function fillEntities(text, entities) {
+  const map = bytesToChars(text); const tb = $("entities").querySelector("tbody"); tb.innerHTML = "";
+  for (const e of entities) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td><span class="pill" style="background:${color(e.type)}">${e.type}</span></td><td>${escapeHtml(text.slice(map[e.start], map[e.end]))}</td><td>${e.confidence.toFixed(2)}</td><td>${escapeHtml(e.evidence)}</td><td>${e.mask !== undefined ? escapeHtml(e.mask) : ""}</td>`;
+    tb.appendChild(tr);
+  }
+  $("highlight").innerHTML = entities.length ? highlight(text, entities) : escapeHtml(text) + "\n\n(персональные данные не найдены)";
+}
+let lastPayloadId = null;
+async function detect() {
+  $("error").textContent = "";
+  try {
+    const text = $("text").value;
+    const { json, ms, rid } = await call("/v1/detect", { text, ...systemField() });
+    fillEntities(text, json.entities);
+    $("detectMeta").textContent = `${json.entities.length} сущностей · ${ms} мс · система ${json.system} · request ${rid}`;
+  } catch (e) { $("error").textContent = e.message; }
+}
+async function mask() {
+  $("error").textContent = "";
+  try {
+    const text = $("text").value;
+    const { json, ms, rid } = await call("/v1/mask", { text, ...systemField() });
+    fillEntities(text, json.entities);
+    $("detectMeta").textContent = `${json.entities.length} сущностей · ${ms} мс · система ${json.system} · request ${rid}`;
+    lastPayloadId = json.payload_id; $("payloadId").textContent = json.payload_id;
+    $("masked").textContent = json.masked;
+    $("maskMeta").textContent = `${ms} мс · хранилище ${json.degraded ? "ДЕГРАДИРОВАНО (память)" : "ok"} · типы: ${[...new Set(json.entities.map(e => e.type))].join(", ") || "—"}`;
+    $("demasked").textContent = "—"; $("demaskMeta").textContent = "";
+  } catch (e) { $("error").textContent = e.message; }
+}
+async function demask() {
+  $("error").textContent = "";
+  if (!lastPayloadId) { $("error").textContent = "Сначала замаскируйте текст."; return; }
+  try {
+    const { json, ms } = await call("/v1/demask", { text: $("masked").textContent, payload_id: lastPayloadId, ...systemField() });
+    $("demasked").textContent = json.text;
+    const same = json.text === $("text").value;
+    $("demaskMeta").innerHTML = `${ms} мс · восстановлено записей: ${json.entries} · ${same ? '<b style="color:var(--ok)">совпадает с исходным текстом символ в символ</b>' : '<b style="color:var(--warn)">отличается от исходного</b>'}`;
+  } catch (e) { $("error").textContent = e.message; }
+}
+async function llm() {
+  $("error").textContent = ""; $("llmMasked").textContent = "…"; $("llmDemasked").textContent = "…";
+  try {
+    const body = { model: "default", messages: [{ role: "system", content: "Ты помощник банка. Кратко перескажи данные клиента из сообщения и предложи следующий шаг." }, { role: "user", content: $("text").value }], ...( $("apikey").value.trim() ? {} : { maskarad_system: $("system").value }) };
+    const t0 = performance.now();
+    const res = await fetch("/v1/chat/completions", { method: "POST", headers: headers(), body: JSON.stringify(body) });
+    const json = await res.json();
+    if (!res.ok) throw new Error(`${res.status} ${json.error ? json.error.code + ": " + json.error.message : ""}`);
+    const content = json.choices?.[0]?.message?.content ?? JSON.stringify(json);
+    $("llmDemasked").textContent = content;
+    $("llmMasked").textContent = json.maskarad?.demasked ? "(демаскировано ниже; исходный ответ модели содержал плейсхолдеры)" : content;
+    $("llmMeta").textContent = `${(performance.now() - t0).toFixed(0)} мс · сущностей замаскировано: ${json.maskarad?.entities ?? "?"} · демаскирование: ${json.maskarad?.demasked ? "да" : "нет"}`;
+  } catch (e) { $("error").textContent = e.message; $("llmMasked").textContent = "—"; $("llmDemasked").textContent = "—"; }
+}
+function systemRowHtml(s) {
+  const yesNo = (v) => (v ? "да" : "<b>нет</b>");
+  const types = Array.isArray(s.pii_types) ? s.pii_types.join(", ") : s.pii_types;
+  const excluded = s.exclude_types.length ? " (кроме " + s.exclude_types.join(", ") + ")" : "";
+  return `<td><code>${s.id}</code>${s.anonymous ? " <small>(без ключа)</small>" : ""}</td><td>${escapeHtml(s.description)}</td><td>${yesNo(s.enabled)}</td><td>${s.profile}</td><td>${yesNo(s.demask)}</td><td>${types}${excluded}</td><td>${s.weak_entities}</td><td>${s.combination_rules}</td>`;
+}
+async function loadSystems() {
+  try {
+    const res = await fetch("/v1/systems"); if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const list = await res.json(); const tb = $("systems").querySelector("tbody"); tb.innerHTML = "";
+    for (const s of list) {
+      const o = document.createElement("option"); o.value = s.id; o.textContent = `${s.id} (${s.profile})`; if (s.enabled) $("system").appendChild(o);
+      const tr = document.createElement("tr");
+      tr.innerHTML = systemRowHtml(s);
+      tb.appendChild(tr);
+    }
+    const bot = [...$("system").options].find(o => o.value.includes("chatbot")); if (bot) $("system").value = bot.value;
+  } catch { $("systems").querySelector("tbody").innerHTML = "<tr><td colspan=8>Список систем доступен с админ-ключом или в демо-режиме (ui.allow_system_override).</td></tr>"; }
+}
+async function status() {
+  try { const r = await fetch("/readyz"); const j = await r.json();
+    $("status").innerHTML = `состояние: <b class="${j.status === "ok" ? "" : "bad"}">${j.status}</b> · хранилище ${j.store.backend}${j.store.degraded ? " (деградация)" : ""} · систем ${j.engine.systems} · типов ПДн ${j.engine.types} · LLM ${j.llm.configured ? "настроен" : "не настроен"}`;
+  } catch { $("status").innerHTML = '<b class="bad">сервис недоступен</b>'; }
+}
+$("btnDetect").onclick = detect; $("btnMask").onclick = mask; $("btnDemask").onclick = demask; $("btnLlm").onclick = llm;
+loadSystems(); status(); setInterval(status, 10000);
+</script>
+</body>
+</html>

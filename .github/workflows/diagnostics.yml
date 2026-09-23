@@ -1,0 +1,95 @@
+# Снимок состояния кластера в лог Actions: поды, события, логи сервиса, Ingress, сертификаты,
+# агенты наблюдаемости (prometheus-agent, fluent-bit).
+name: diagnostics
+
+on:
+  workflow_dispatch:
+    inputs:
+      namespace:
+        description: Namespace сервиса
+        default: maskarad
+      tail:
+        description: Сколько строк логов сервиса показать
+        default: "200"
+
+permissions:
+  contents: read
+
+jobs:
+  dump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/yc
+        with:
+          sa-key: ${{ secrets.YC_SA_KEY_JSON }}
+          cloud-id: ${{ vars.YC_CLOUD_ID || 'b1gt5hdhuc4hovu7kij9' }}
+          folder-id: ${{ vars.YC_FOLDER_ID || 'b1gg8haq1qnfi8a272of' }}
+      - uses: azure/setup-kubectl@v4
+      - uses: azure/setup-helm@v4
+      - name: Kubeconfig
+        run: yc managed-kubernetes cluster get-credentials maskarad --external --force
+      - name: Cloud resources
+        run: |
+          echo "::group::Kubernetes clusters"; yc managed-kubernetes cluster list; echo "::endgroup::"
+          echo "::group::Node groups"; yc managed-kubernetes node-group list; echo "::endgroup::"
+          echo "::group::Valkey clusters"; yc managed-redis cluster list || true; echo "::endgroup::"
+          echo "::group::Container registry"; yc container registry list; yc container image list --repository-name "$(yc container registry get --name maskarad --format json | jq -r .id)/maskarad" || true; echo "::endgroup::"
+          echo "::group::DNS"; yc dns zone list; echo "::endgroup::"
+          echo "::group::Cluster operations"; yc managed-kubernetes cluster list-operations maskarad --format yaml || true; echo "::endgroup::"
+          echo "::group::Node group operations"; yc managed-kubernetes node-group list-operations maskarad-workers --format yaml || true; echo "::endgroup::"
+          echo "::group::Instance group and instances"
+          ig=$(yc managed-kubernetes node-group get maskarad-workers --format json | jq -r .instance_group_id)
+          yc compute instance-group get "$ig" --format yaml | grep -E "^(status|managed_instances_count|deploy_policy|allocation_policy):|  (running_actual|running_outdated|starting|stopping|creating|deleting)_count" || true
+          yc compute instance-group list-instances "$ig" || true
+          yc compute instance list || true
+          echo "::endgroup::"
+          echo "::group::Network load balancers"
+          yc load-balancer network-load-balancer list || true
+          for lb in $(yc load-balancer network-load-balancer list --format json | jq -r '.[].id'); do
+            yc load-balancer network-load-balancer target-states "$lb" --target-group-id "$(yc load-balancer network-load-balancer get "$lb" --format json | jq -r '.attached_target_groups[0].target_group_id')" || true
+          done
+          echo "::endgroup::"
+          echo "::group::Addresses and quotas"
+          yc vpc address list || true
+          yc quota-manager quota-limit list --service vpc --resource-type resource-manager.cloud --resource-id "$YC_CLOUD_ID" --format yaml 2>/dev/null | grep -B1 -A3 -iE "external|address" || true
+          echo "::endgroup::"
+          echo "::group::Subnets and route tables"; yc vpc subnet list; yc vpc route-table list; yc vpc gateway list; echo "::endgroup::"
+          echo "::group::Security groups"; yc vpc security-group list --format yaml || true; echo "::endgroup::"
+      - name: Kubernetes API reachability
+        run: |
+          ep=$(yc managed-kubernetes cluster get maskarad --format json | jq -r .master.endpoints.external_v4_endpoint)
+          echo "endpoint: $ep"
+          for i in 1 2 3; do
+            curl -sk -m 10 -o /dev/null -w "attempt $i: http=%{http_code} connect=%{time_connect}s\n" "$ep/version" || echo "attempt $i: connect failed (exit $?)"
+            sleep 5
+          done
+      - name: Cluster
+        run: |
+          echo "::group::Nodes"; kubectl get nodes -o wide; kubectl top nodes || true; echo "::endgroup::"
+          echo "::group::All pods"; kubectl get pods -A -o wide; echo "::endgroup::"
+          echo "::group::Helm releases"; helm list -A; echo "::endgroup::"
+          echo "::group::Ingress and load balancer"; kubectl get ingress -A; kubectl -n ingress-nginx get svc; echo "::endgroup::"
+          echo "::group::Certificates"; kubectl get certificates,certificaterequests,orders,challenges -A || true; echo "::endgroup::"
+          echo "::group::ClusterIssuers"; kubectl get clusterissuer -o wide || true; echo "::endgroup::"
+      - name: Service namespace ${{ inputs.namespace }}
+        run: |
+          ns="${{ inputs.namespace }}"
+          echo "::group::Objects"; kubectl -n "$ns" get all,ingress,hpa,pdb,configmap -o wide || true; echo "::endgroup::"
+          echo "::group::Events"; kubectl -n "$ns" get events --sort-by=.lastTimestamp | tail -60 || true; echo "::endgroup::"
+          echo "::group::Deployment"; kubectl -n "$ns" describe deployment maskarad || true; echo "::endgroup::"
+          echo "::group::Pods"; kubectl -n "$ns" describe pods -l app.kubernetes.io/name=maskarad | tail -120 || true; echo "::endgroup::"
+          echo "::group::Service logs (last ${{ inputs.tail }} lines)"; kubectl -n "$ns" logs deployment/maskarad --all-containers --tail="${{ inputs.tail }}" || true; echo "::endgroup::"
+          echo "::group::Previous container logs"; kubectl -n "$ns" logs deployment/maskarad --previous --tail=100 2>/dev/null || echo "(no previous container)"; echo "::endgroup::"
+      - name: Addon logs
+        run: |
+          echo "::group::cert-manager"; kubectl -n cert-manager logs deployment/cert-manager --tail=80 || true; echo "::endgroup::"
+          echo "::group::ingress-nginx"; kubectl -n ingress-nginx logs -l app.kubernetes.io/component=controller --all-containers --prefix --tail=150 || true; echo "::endgroup::"
+          echo "::group::Observability agents (observability): prometheus-agent, fluent-bit"
+          kubectl -n observability get pods -o wide || true
+          kubectl -n observability logs deploy/prometheus-agent --tail=60 || true
+          kubectl -n observability logs -l app.kubernetes.io/name=fluent-bit --prefix --tail=500 | grep -vE 'HTTP status=20[0-5]' | tail -60 || true
+          echo "::endgroup::"
+          echo "::group::Readiness from inside the cluster"
+          kubectl -n "${{ inputs.namespace }}" run diag-curl --rm -i --restart=Never --image=curlimages/curl:8.10.1 -- -sS -m 10 http://maskarad/readyz || true
+          echo "::endgroup::"
